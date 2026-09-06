@@ -20,6 +20,14 @@ function toISO(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.
 function parseISO(s) { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); }
 function addDays(date, n) { const d = new Date(date); d.setDate(d.getDate() + n); return d; }
 function isWeekend(d) { const day = d.getDay(); return day === 0 || day === 6; }
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 function easterSunday(year) {
   const a = year % 19, b = Math.floor(year / 100), c = year % 100;
@@ -492,6 +500,8 @@ function renderCard(entry) {
   const dleft = daysUntil(entry.deadline);
   const isErledigt = entry.status === "erledigt";
   const meta = STATUS_META[status];
+  const rawTypeLabel = TYPE_META[entry.type] ? TYPE_META[entry.type].label : entry.type;
+  const safeTypeLabel = escapeHtml(rawTypeLabel);
 
   const card = document.createElement("div");
   card.className = `fw-card ${isErledigt ? "is-erledigt" : ""}`;
@@ -499,7 +509,7 @@ function renderCard(entry) {
     ${stampSVG(status, dleft)}
     <div class="fw-card-body">
       <div class="fw-card-top">
-        <span class="fw-type-badge">${TYPE_META[entry.type] ? TYPE_META[entry.type].label : entry.type}</span>
+        <span class="fw-type-badge">${safeTypeLabel}</span>
         <span class="fw-type-badge" style="color:${meta.color};border-color:${meta.color}">${meta.label}</span>
       </div>
       <p class="fw-produkt ${isErledigt ? "strike" : ""}"></p>
