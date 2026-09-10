@@ -92,12 +92,21 @@ async function extractTextFromPdf(file) {
   const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
   const maxPages = Math.min(pdf.numPages, 3);
   let text = "";
+  let firstPageLines = [];
   for (let i = 1; i <= maxPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
     text += "\n" + content.items.map((it) => it.str || "").join(" ");
+    if (i === 1) {
+      try {
+        firstPageLines = buildLinesFromPdfTextContent(content, page.getViewport({ scale: 1 }));
+      } catch (e) {
+        firstPageLines = [];
+      }
+    }
   }
   if (text.trim().length < 20) {
+    // Vermutlich ein gescanntes PDF ohne Textebene -> als Bild rendern und per OCR lesen.
     const page = await pdf.getPage(1);
     const viewport = page.getViewport({ scale: 2 });
     const canvas = document.createElement("canvas");
@@ -108,8 +117,9 @@ async function extractTextFromPdf(file) {
     const worker = await getOcrWorker();
     const { data } = await worker.recognize(canvas.toDataURL("image/png"));
     text = (data && data.text) || "";
+    return { text, lines: linesFromTesseractData(data) };
   }
-  return text;
+  return { text, lines: firstPageLines };
 }
 
 function toValidDate(dStr, moStr, yStr) {
@@ -204,7 +214,8 @@ function parseGermanNumber(str) {
 function parseAmountFromText(text) {
   const skipLine = /(netto|zwischensumme|MwSt-?Satz)/i;
   const tiers = [
-    /(gesamtbetrag|endbetrag|rechnungsbetrag|gesamtsumme|zu\s?zahlen(?:der\s?betrag)?|zahlbetrag)[^\d]{0,15}(\d{1,3}(?:\.\d{3})*,\d{2})/i,
+    /(gesamtbetrag|gesamtsumme|endbetrag|rechnungsbetrag)[^\d]{0,15}(\d{1,3}(?:\.\d{3})*,\d{2})/i,
+    /(überweisungsbetrag|ueberweisungsbetrag|zu\s?zahlen(?:der\s?betrag)?|zahlbetrag)[^\d]{0,15}(\d{1,3}(?:\.\d{3})*,\d{2})/i,
     /\b(gesamt|summe|betrag)[^\d]{0,15}(\d{1,3}(?:\.\d{3})*,\d{2})/i,
   ];
   for (const tier of tiers) {
@@ -226,6 +237,8 @@ function parseAmountFromText(text) {
 
 // Naiver Anbieter-Vorschlag: erste plausible Textzeile (meist Firmenname
 // im Kopf des Belegs). Nur ein Vorschlag, der Mensch prüft ihn.
+// Fallback, falls keine Positionsdaten vorliegen: einfach die erste
+// plausible Textzeile.
 function guessMerchant(text) {
   for (const raw of text.split("\n")) {
     const line = raw.trim();
@@ -234,6 +247,85 @@ function guessMerchant(text) {
     return line;
   }
   return null;
+}
+
+// Anbieter/Absender/Zahlungsempfänger stehen auf Belegen fast immer im
+// Kopfbereich — meist oben rechts (Briefkopf) oder in größerer Schrift
+// (Firmenlogo/-name). Diese Funktion bewertet erkannte Textzeilen anhand
+// ihrer Position und Schriftgröße (aus OCR-Bounding-Boxen bzw. PDF-Text-
+// Transformationen) und wählt die plausibelste Kopfzeile — statt einfach
+// nur die erste Zeile im Text zu nehmen.
+function isPlausibleHeaderText(text) {
+  const t = (text || "").trim();
+  if (t.length < 2 || t.length > 60) return false;
+  if (/^[\d.,\-\/\s€%:]+$/.test(t)) return false; // rein numerisch/Datum/Betrag
+  return true;
+}
+function scoreHeaderCandidate(line, pageWidth, pageHeight, maxHeight) {
+  const sizeScore = maxHeight > 0 ? line.height / maxHeight : 0;
+  const verticalFraction = pageHeight > 0 ? line.top / pageHeight : 0;
+  const topScore = Math.max(0, 1 - verticalFraction / 0.35); // Bonus für oberste ~35% der Seite
+  const rightFraction = pageWidth > 0 ? line.right / pageWidth : 0;
+  const rightScore = rightFraction > 0.55 ? 0.3 : 0; // kleiner Bonus für rechtsstehenden Text
+  return sizeScore * 1.5 + topScore * 1.2 + rightScore;
+}
+function guessHeaderCandidate(lines) {
+  if (!lines || !lines.length) return null;
+  const plausible = lines.filter((l) => isPlausibleHeaderText(l.text));
+  if (!plausible.length) return null;
+  const pageWidth = Math.max(...lines.map((l) => l.right));
+  const pageHeight = Math.max(...lines.map((l) => l.bottom));
+  const maxHeight = Math.max(...plausible.map((l) => l.height));
+  let best = null;
+  let bestScore = -Infinity;
+  for (const line of plausible) {
+    const score = scoreHeaderCandidate(line, pageWidth, pageHeight, maxHeight);
+    if (score > bestScore) {
+      bestScore = score;
+      best = line;
+    }
+  }
+  return best ? best.text.trim() : null;
+}
+// Baut Zeilen mit Position/Größe aus dem pdf.js-Textlayer einer Seite:
+// Textfragmente mit ähnlichem y-Wert werden zu einer Zeile zusammengefasst.
+function buildLinesFromPdfTextContent(content, viewport) {
+  const groups = new Map();
+  for (const item of content.items) {
+    if (!item.str || !item.str.trim()) continue;
+    const fontHeight = Math.abs(item.transform[3]) || Math.abs(item.transform[0]) || 10;
+    const x0 = item.transform[4];
+    const y = item.transform[5];
+    const width = item.width || item.str.length * fontHeight * 0.5;
+    const x1 = x0 + width;
+    const key = Math.round(y / 3) * 3; // Zeilen mit ähnlichem y zusammenfassen
+    if (!groups.has(key)) groups.set(key, { text: "", x0, x1, y0: y, y1: y + fontHeight, height: fontHeight });
+    const g = groups.get(key);
+    g.text += (g.text ? " " : "") + item.str;
+    g.x0 = Math.min(g.x0, x0);
+    g.x1 = Math.max(g.x1, x1);
+    g.height = Math.max(g.height, fontHeight);
+  }
+  const pageHeight = viewport.height;
+  // PDF-Koordinaten wachsen nach oben — für unsere top/bottom-Logik umdrehen.
+  return Array.from(groups.values()).map((g) => ({
+    text: g.text,
+    left: g.x0,
+    right: g.x1,
+    top: pageHeight - g.y1,
+    bottom: pageHeight - g.y0,
+    height: g.height,
+  }));
+}
+function linesFromTesseractData(data) {
+  return ((data && data.lines) || []).map((l) => ({
+    text: l.text,
+    left: l.bbox.x0,
+    right: l.bbox.x1,
+    top: l.bbox.y0,
+    bottom: l.bbox.y1,
+    height: l.bbox.y1 - l.bbox.y0,
+  }));
 }
 
 // IBAN-Prüfsumme (ISO 7064 MOD 97-10): erste 4 Zeichen ans Ende verschieben,
@@ -646,6 +738,8 @@ const previewLine = $("#preview-line");
 const fileRow = $("#file-row");
 const fileError = $("#file-error");
 const ocrStatus = $("#ocr-status");
+const ocrSpinner = $("#ocr-spinner");
+const ocrStatusText = $("#ocr-status-text");
 const saveBtn = $("#btn-save");
 
 let currentType = "retoure";
@@ -804,15 +898,23 @@ async function getTextFromFile(file) {
   const ocrDataUrl = await resizeImage(file, 1500, 0.9);
   const worker = await getOcrWorker();
   const { data } = await worker.recognize(ocrDataUrl);
-  return (data && data.text) || "";
+  return { text: (data && data.text) || "", lines: linesFromTesseractData(data) };
+}
+
+function setOcrStatus(state, text) {
+  // state: "loading" | "success" | "neutral"
+  ocrStatus.style.display = "flex";
+  ocrStatus.className = `fw-ocr-status is-${state}`;
+  ocrSpinner.style.display = state === "loading" ? "block" : "none";
+  ocrStatusText.textContent = text;
 }
 
 async function runOcr(file) {
-  ocrStatus.style.display = "block";
-  ocrStatus.style.color = "var(--slate)";
-  ocrStatus.textContent = file.type === "application/pdf" ? "PDF wird gelesen …" : "Beleg wird gelesen …";
+  // Deutlich sichtbarer Hinweis, solange der Scan läuft — leicht zu
+  // übersehen, wenn es nur ein kleiner grauer Text ist.
+  setOcrStatus("loading", file.type === "application/pdf" ? "PDF wird gelesen …" : "Beleg wird gelesen …");
   try {
-    const text = await getTextFromFile(file);
+    const { text, lines } = await getTextFromFile(file);
     const applied = [];
 
     if (!dateTouched) {
@@ -831,10 +933,13 @@ async function runOcr(file) {
         applied.push("Betrag");
       }
     }
+    // Anbieter/Absender: bevorzugt die Kopfzeile mit der größten Schrift
+    // bzw. oben rechts im Beleg (Positions-/Größenanalyse), sonst die
+    // erste plausible Textzeile als Rückfallebene.
+    const headerGuess = guessHeaderCandidate(lines) || guessMerchant(text);
     if (!produktTouched && !produktInput.value.trim()) {
-      const merchant = guessMerchant(text);
-      if (merchant) {
-        produktInput.value = merchant;
+      if (headerGuess) {
+        produktInput.value = headerGuess;
         saveBtn.disabled = false;
         applied.push("Anbieter");
       }
@@ -855,7 +960,11 @@ async function runOcr(file) {
         }
       }
       if (!empfaengerTouched) {
-        const recipient = parseRecipientFromText(text) || produktInput.value.trim() || null;
+        // Gleiches Verfahren wie beim Anbieter: erst explizites Stichwort
+        // ("Zahlungsempfänger", "Kontoinhaber" …), sonst dieselbe
+        // Kopfzeilen-Erkennung, sonst als letzte Rückfallebene das bereits
+        // erkannte Anbieter-Feld.
+        const recipient = parseRecipientFromText(text) || headerGuess || produktInput.value.trim() || null;
         if (recipient) {
           empfaengerInput.value = recipient;
           applied.push("Zahlungsempfänger");
@@ -864,15 +973,12 @@ async function runOcr(file) {
     }
 
     if (applied.length) {
-      ocrStatus.style.color = "var(--green)";
-      ocrStatus.textContent = `Aus dem Beleg erkannt: ${applied.join(", ")} — bitte prüfen.`;
+      setOcrStatus("success", `Aus dem Beleg erkannt: ${applied.join(", ")} — bitte prüfen.`);
     } else {
-      ocrStatus.style.color = "var(--slate)";
-      ocrStatus.textContent = "Im Beleg konnte nichts Eindeutiges erkannt werden.";
+      setOcrStatus("neutral", "Im Beleg konnte nichts Eindeutiges erkannt werden.");
     }
   } catch (e) {
-    ocrStatus.style.color = "var(--slate)";
-    ocrStatus.textContent = "Texterkennung nicht verfügbar (evtl. kein Internet beim ersten Mal nötig).";
+    setOcrStatus("neutral", "Texterkennung nicht verfügbar (evtl. kein Internet beim ersten Mal nötig).");
   }
 }
 function showFileRow() {

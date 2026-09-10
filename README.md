@@ -93,6 +93,26 @@ eindeutig die Gesamtsumme ("Gesamtbetrag", "Endbetrag") und überspringt
 bewusst Zwischensummen wie "Nettobetrag", damit nicht versehentlich der
 Betrag vor Mehrwertsteuer übernommen wird.
 
+## Verbesserte Erkennung (Anbieter, Zahlungsempfänger, Betrag)
+
+- **Anbieter/Zahlungsempfänger**: Die App bewertet jetzt Textzeilen im Beleg
+  nach Position und Schriftgröße statt einfach nur die erste Zeile zu
+  nehmen — Firmennamen im Briefkopf stehen meist oben rechts oder in
+  größerer Schrift, genau das wird jetzt bevorzugt erkannt. Bei
+  "Zahlungsempfänger" wird zuerst nach einem expliziten Stichwort gesucht
+  ("Zahlungsempfänger", "Kontoinhaber" …), dann dasselbe Verfahren wie beim
+  Anbieter angewandt, als letzte Rückfallebene das bereits erkannte
+  Anbieter-Feld.
+- **Betrag-Priorität**: Erkennt zuerst "Gesamtbetrag"/"Gesamtsumme", dann
+  "Überweisungsbetrag"/"zu zahlen(der Betrag)", erst danach die bisherigen,
+  allgemeineren Stichwörter.
+
+## Deutlicherer Scan-Hinweis
+
+Während ein Foto/PDF gelesen wird, zeigt die App jetzt einen auffälligen
+Hinweis mit Lade-Spinner (statt eines kleinen grauen Texthinweises) —
+leichter zu erkennen, dass die Erkennung noch läuft.
+
 ## Texterkennung (OCR) beim Foto-Upload
 
 Beim Hochladen eines Fotos (Lieferschein, Bescheid, Rechnung) liest die App

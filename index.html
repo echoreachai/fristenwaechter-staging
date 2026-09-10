@@ -94,7 +94,10 @@
           <input type="file" class="fw-input" id="input-file" accept="image/*,application/pdf" />
           <div class="fw-file-row" id="file-row" style="display:none"></div>
           <p class="fw-hint" id="file-error" style="display:none;color:var(--red)"></p>
-          <p class="fw-hint" id="ocr-status" style="display:none"></p>
+          <div class="fw-ocr-status" id="ocr-status" style="display:none">
+            <span class="fw-ocr-spinner" id="ocr-spinner"></span>
+            <span id="ocr-status-text"></span>
+          </div>
           <p class="fw-hint">Füllt Datum, Betrag & mehr automatisch aus — die restlichen Felder unten kannst du danach einfach noch prüfen.</p>
         </div>
 
