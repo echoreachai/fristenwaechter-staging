@@ -1038,6 +1038,15 @@ form.addEventListener("submit", (e) => {
 
 const viewerOverlay = $("#fw-viewer-overlay");
 const viewerBox = $("#fw-viewer-content");
+function sanitizePreviewDataUrl(value) {
+  if (typeof value !== "string") return null;
+  if (!value.startsWith("data:")) return null;
+  const m = value.match(/^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$/);
+  if (!m) return null;
+  const mime = m[1].toLowerCase();
+  if (!["application/pdf", "image/png", "image/jpeg", "image/webp", "image/gif"].includes(mime)) return null;
+  return value;
+}
 function openViewer(beleg) {
   currentBeleg = beleg;
   viewerBox.innerHTML = "";
@@ -1045,8 +1054,9 @@ function openViewer(beleg) {
   // könnte bei einem importierten Backup manipuliert sein), sondern den
   // echten Anfang der Data-URL selbst prüfen. Zusätzlich läuft der
   // PDF-Viewer in einem "sandbox"-iframe ohne Skriptrechte.
-  const isRealPdf = typeof beleg.dataUrl === "string" && beleg.dataUrl.startsWith("data:application/pdf");
-  const isRealImage = typeof beleg.dataUrl === "string" && /^data:image\/(png|jpe?g|webp|gif);base64,/.test(beleg.dataUrl);
+  const safeDataUrl = sanitizePreviewDataUrl(beleg.dataUrl);
+  const isRealPdf = typeof safeDataUrl === "string" && safeDataUrl.startsWith("data:application/pdf;base64,");
+  const isRealImage = typeof safeDataUrl === "string" && /^data:image\/(png|jpeg|webp|gif);base64,/.test(safeDataUrl);
 
   if (isRealPdf) {
     const iframe = document.createElement("iframe");
@@ -1058,7 +1068,7 @@ function openViewer(beleg) {
     viewerBox.appendChild(iframe);
   } else if (isRealImage) {
     const img = document.createElement("img");
-    img.src = beleg.dataUrl;
+    img.src = safeDataUrl;
     img.className = "fw-viewer-img";
     viewerBox.appendChild(img);
   } else {
