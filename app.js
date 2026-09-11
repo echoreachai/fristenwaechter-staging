@@ -489,7 +489,15 @@ function loadEntries() {
 }
 function saveEntries(entries) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
+    const persistedEntries = Array.isArray(entries)
+      ? entries.map((entry) => {
+          if (!entry || typeof entry !== "object") return entry;
+          const iban = typeof entry.iban === "string" ? entry.iban.trim() : "";
+          const maskedIban = iban ? `****${iban.slice(-4)}` : "";
+          return { ...entry, iban: maskedIban };
+        })
+      : [];
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedEntries));
     return true;
   } catch (e) {
     showError("Speichern fehlgeschlagen (evtl. Speicher voll). Alte Belege ggf. löschen.");
