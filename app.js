@@ -1038,6 +1038,7 @@ form.addEventListener("submit", (e) => {
 
 const viewerOverlay = $("#fw-viewer-overlay");
 const viewerBox = $("#fw-viewer-content");
+let currentViewerObjectUrl = null;
 function sanitizePreviewDataUrl(value) {
   if (typeof value !== "string") return null;
   if (!value.startsWith("data:")) return null;
@@ -1047,8 +1048,31 @@ function sanitizePreviewDataUrl(value) {
   if (!["application/pdf", "image/png", "image/jpeg", "image/webp", "image/gif"].includes(mime)) return null;
   return value;
 }
+function dataUrlToObjectUrl(dataUrl) {
+  const m = dataUrl.match(/^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$/);
+  if (!m) return null;
+  const mime = m[1].toLowerCase();
+  const base64 = m[2];
+  let bin;
+  try {
+    bin = atob(base64);
+  } catch (_) {
+    return null;
+  }
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const blob = new Blob([bytes], { type: mime });
+  return URL.createObjectURL(blob);
+}
+function clearViewerObjectUrl() {
+  if (currentViewerObjectUrl) {
+    URL.revokeObjectURL(currentViewerObjectUrl);
+    currentViewerObjectUrl = null;
+  }
+}
 function openViewer(beleg) {
   currentBeleg = beleg;
+  clearViewerObjectUrl();
   viewerBox.innerHTML = "";
   // Sicherheit: nicht dem separat mitgeführten "mime"-Feld vertrauen (das
   // könnte bei einem importierten Backup manipuliert sein), sondern den
@@ -1060,7 +1084,10 @@ function openViewer(beleg) {
 
   if (isRealPdf) {
     const iframe = document.createElement("iframe");
-    iframe.src = beleg.dataUrl;
+    const objectUrl = dataUrlToObjectUrl(safeDataUrl);
+    if (!objectUrl) throw new Error("Ungültige Datei für Vorschau");
+    currentViewerObjectUrl = objectUrl;
+    iframe.src = objectUrl;
     iframe.style.width = "80vw";
     iframe.style.height = "78vh";
     iframe.style.border = "none";
@@ -1068,7 +1095,10 @@ function openViewer(beleg) {
     viewerBox.appendChild(iframe);
   } else if (isRealImage) {
     const img = document.createElement("img");
-    img.src = safeDataUrl;
+    const objectUrl = dataUrlToObjectUrl(safeDataUrl);
+    if (!objectUrl) throw new Error("Ungültige Datei für Vorschau");
+    currentViewerObjectUrl = objectUrl;
+    img.src = objectUrl;
     img.className = "fw-viewer-img";
     viewerBox.appendChild(img);
   } else {
