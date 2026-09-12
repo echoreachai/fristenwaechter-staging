@@ -492,9 +492,7 @@ function saveEntries(entries) {
     const persistedEntries = Array.isArray(entries)
       ? entries.map((entry) => {
           if (!entry || typeof entry !== "object") return entry;
-          const iban = typeof entry.iban === "string" ? entry.iban.trim() : "";
-          const maskedIban = iban ? `****${iban.slice(-4)}` : "";
-          return { ...entry, iban: maskedIban };
+          return { ...entry, iban: "" };
         })
       : [];
     localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedEntries));
