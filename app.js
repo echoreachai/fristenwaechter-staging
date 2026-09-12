@@ -481,20 +481,21 @@ const STORAGE_KEY = "fw_entries";
 const NOTIFIED_KEY = "fw_notified_on";
 const SENDER_KEY = "fw_sender";
 
+function stripSensitiveEntryFields(entry) {
+  if (!entry || typeof entry !== "object") return entry;
+  return { ...entry, iban: "" };
+}
+
 function loadEntries() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.map(stripSensitiveEntryFields) : [];
   } catch (e) { return []; }
 }
 function saveEntries(entries) {
   try {
-    const persistedEntries = Array.isArray(entries)
-      ? entries.map((entry) => {
-          if (!entry || typeof entry !== "object") return entry;
-          return { ...entry, iban: "" };
-        })
-      : [];
+    const persistedEntries = Array.isArray(entries) ? entries.map(stripSensitiveEntryFields) : [];
     localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedEntries));
     return true;
   } catch (e) {
