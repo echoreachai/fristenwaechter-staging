@@ -1,0 +1,41 @@
+rules:
+  - id: java-dangerous-deserialization
+    patterns:
+      - pattern: |
+          ObjectInputStream $X = new ObjectInputStream($Y);
+    message: Unsichere Java-Deserialisierung – kann zu RCE führen.
+    languages: [java]
+    severity: ERROR
+
+  - id: html-inline-script
+    patterns:
+      - pattern: |
+          <script>$X</script>
+    message: Inline-Skripte sind anfällig für XSS – besser extern laden.
+    languages: [html]
+    severity: WARNING
+
+  - id: html-dangerous-attribute
+    patterns:
+      - pattern: |
+          <img src="javascript:$X" />
+    message: Gefährliches HTML-Attribut – XSS möglich.
+    languages: [html]
+    severity: ERROR
+
+  - id: css-external-url
+    patterns:
+      - pattern: |
+          url("http://$X")
+    message: Unsichere externe CSS-Ressource – MITM möglich.
+    languages: [css]
+    severity: WARNING
+
+  - id: java-sql-injection
+    patterns:
+      - pattern: |
+          Statement $S = $C.createStatement();
+          $S.executeQuery($Q);
+    message: Mögliche SQL-Injection – PreparedStatements verwenden.
+    languages: [java]
+    severity: ERROR
