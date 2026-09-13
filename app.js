@@ -464,7 +464,6 @@ function sanitizeImportedEntry(raw) {
     referenz: str(raw.referenz, 100),
     adresse: str(raw.adresse, 500),
     empfaenger: str(raw.empfaenger, 200),
-    iban: str(raw.iban, 40),
     beleg,
     status: raw.status === "erledigt" ? "erledigt" : "aktiv",
     createdAt: str(raw.createdAt, 40) || new Date().toISOString(),
@@ -483,8 +482,21 @@ const SENDER_KEY = "fw_sender";
 
 function stripSensitiveEntryFields(entry) {
   if (!entry || typeof entry !== "object") return entry;
-  const { iban, ...safeEntry } = entry;
-  return safeEntry;
+  return {
+    id: entry.id,
+    type: entry.type,
+    produkt: entry.produkt,
+    erhalten: entry.erhalten,
+    deadline: entry.deadline,
+    betrag: entry.betrag,
+    notiz: entry.notiz,
+    referenz: entry.referenz,
+    adresse: entry.adresse,
+    empfaenger: entry.empfaenger,
+    beleg: entry.beleg,
+    status: entry.status,
+    createdAt: entry.createdAt,
+  };
 }
 
 function loadEntries() {
