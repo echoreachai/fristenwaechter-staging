@@ -1093,6 +1093,15 @@ function sanitizeViewerDataUrl(value) {
   return (pdfRe.test(v) || imgRe.test(v)) ? v : null;
 }
 
+function dataUrlToBlobUrl(dataUrl, mimeType) {
+  const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1).replace(/\s+/g, "");
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const blob = new Blob([bytes], { type: mimeType });
+  return URL.createObjectURL(blob);
+}
+
 function openViewer(beleg) {
   currentBeleg = beleg;
   viewerBox.innerHTML = "";
@@ -1106,11 +1115,15 @@ function openViewer(beleg) {
 
   if (isRealPdf) {
     const iframe = document.createElement("iframe");
-    iframe.src = safeDataUrl;
+    const pdfBlobUrl = dataUrlToBlobUrl(safeDataUrl, "application/pdf");
+    iframe.src = pdfBlobUrl;
     iframe.style.width = "80vw";
     iframe.style.height = "78vh";
     iframe.style.border = "none";
     iframe.setAttribute("sandbox", ""); // keine Skriptausführung, keine Formulare, keine Navigation
+    iframe.addEventListener("load", () => {
+      URL.revokeObjectURL(pdfBlobUrl);
+    }, { once: true });
     viewerBox.appendChild(iframe);
   } else if (isRealImage) {
     const img = document.createElement("img");
