@@ -160,6 +160,10 @@ const DATE_KEYWORD_TIERS_BY_TYPE = {
     ["fällig", "faellig", "frist"],
     ["rechnungsdatum", "datum"],
   ],
+  sonstiges: [
+    ["frist", "stichtag", "fällig", "faellig", "termin"],
+    ["datum"],
+  ],
 };
 
 function parseDateFromText(text, type) {
@@ -431,6 +435,7 @@ const TYPE_META = {
   abo: { label: "Abo-Kündigung" },
   strafzettel: { label: "Strafzettel" },
   rechnung: { label: "Offene Rechnung" },
+  sonstiges: { label: "Sonstiges" },
 };
 
 // Sicherheit: Einträge aus einer importierten Backup-Datei kommen von
@@ -464,6 +469,7 @@ function sanitizeImportedEntry(raw) {
     referenz: str(raw.referenz, 100),
     adresse: str(raw.adresse, 500),
     empfaenger: str(raw.empfaenger, 200),
+    iban: str(raw.iban, 40),
     beleg,
     status: raw.status === "erledigt" ? "erledigt" : "aktiv",
     createdAt: str(raw.createdAt, 40) || new Date().toISOString(),
@@ -480,36 +486,15 @@ const STORAGE_KEY = "fw_entries";
 const NOTIFIED_KEY = "fw_notified_on";
 const SENDER_KEY = "fw_sender";
 
-function stripSensitiveEntryFields(entry) {
-  if (!entry || typeof entry !== "object") return entry;
-  return {
-    id: entry.id,
-    type: entry.type,
-    produkt: entry.produkt,
-    erhalten: entry.erhalten,
-    deadline: entry.deadline,
-    betrag: entry.betrag,
-    notiz: entry.notiz,
-    referenz: entry.referenz,
-    adresse: entry.adresse,
-    empfaenger: entry.empfaenger,
-    beleg: entry.beleg,
-    status: entry.status,
-    createdAt: entry.createdAt,
-  };
-}
-
 function loadEntries() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed.map(stripSensitiveEntryFields) : [];
+    return raw ? JSON.parse(raw) : [];
   } catch (e) { return []; }
 }
 function saveEntries(entries) {
   try {
-    const persistedEntries = Array.isArray(entries) ? entries.map(stripSensitiveEntryFields) : [];
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedEntries));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
     return true;
   } catch (e) {
     showError("Speichern fehlgeschlagen (evtl. Speicher voll). Alte Belege ggf. löschen.");
@@ -528,6 +513,8 @@ function saveSenderData(sender) {
 
 let entries = loadEntries();
 let filter = "aktiv";
+let searchQuery = "";
+let sortMode = "deadline-asc";
 let currentBeleg = null;
 
 /* ---------- Bild-Verkleinerung ---------- */
@@ -572,6 +559,24 @@ function showError(msg) {
   setTimeout(() => { errorBox.style.display = "none"; }, 5000);
 }
 
+function sortEntries(list, mode) {
+  const sorted = list.slice();
+  if (mode === "deadline-desc") {
+    sorted.sort((a, b) => parseISO(b.deadline) - parseISO(a.deadline));
+  } else if (mode === "created-desc") {
+    sorted.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+  } else if (mode === "alpha") {
+    sorted.sort((a, b) => a.produkt.localeCompare(b.produkt, "de", { sensitivity: "base" }));
+  } else {
+    // deadline-asc (Standard): offene Einträge zuerst nach Frist, erledigte ans Ende
+    sorted.sort((a, b) => {
+      if (a.status !== b.status) return a.status === "erledigt" ? 1 : -1;
+      return parseISO(a.deadline) - parseISO(b.deadline);
+    });
+  }
+  return sorted;
+}
+
 function render() {
   const active = entries.filter((e) => e.status !== "erledigt");
   const dringend = active.filter((e) => ["dringend", "abgelaufen"].includes(statusOf(e)));
@@ -582,23 +587,31 @@ function render() {
   statAktiv.textContent = active.length;
   statGesamt.textContent = entries.length;
 
-  const visible = entries
-    .filter((e) => {
-      if (filter === "aktiv") return e.status !== "erledigt";
-      if (filter === "erledigt") return e.status === "erledigt";
-      return true;
-    })
-    .sort((a, b) => {
-      if (a.status !== b.status) return a.status === "erledigt" ? 1 : -1;
-      return parseISO(a.deadline) - parseISO(b.deadline);
+  const query = searchQuery.trim().toLowerCase();
+  let visible = entries.filter((e) => {
+    if (filter === "aktiv") return e.status !== "erledigt";
+    if (filter === "erledigt") return e.status === "erledigt";
+    return true;
+  });
+  if (query) {
+    visible = visible.filter((e) => {
+      const haystack = [e.produkt, e.notiz, e.referenz].filter(Boolean).join(" ").toLowerCase();
+      return haystack.includes(query);
     });
+  }
+  visible = sortEntries(visible, sortMode);
 
   listEl.innerHTML = "";
   if (visible.length === 0) {
-    listEl.innerHTML = `<div class="fw-empty">
-      <div class="fw-empty-title">Noch nichts eingetragen</div>
-      <p>Trage eine Bestellung oder ein Abo ein — die Frist wird automatisch berechnet.</p>
-    </div>`;
+    listEl.innerHTML = entries.length === 0
+      ? `<div class="fw-empty">
+          <div class="fw-empty-title">Noch nichts eingetragen</div>
+          <p>Trage eine Bestellung oder ein Abo ein — die Frist wird automatisch berechnet.</p>
+        </div>`
+      : `<div class="fw-empty">
+          <div class="fw-empty-title">Keine Treffer</div>
+          <p>Keine Einträge passen zur aktuellen Suche/Filterung.</p>
+        </div>`;
     return;
   }
   visible.forEach((entry) => listEl.appendChild(renderCard(entry)));
@@ -628,6 +641,7 @@ function metaLine(entry) {
   else if (entry.type === "abo") base = `Frist/Stichtag: ${formatDate(entry.deadline)}`;
   else if (entry.type === "strafzettel") base = `Zahlungs-/Einspruchsfrist: ${formatDate(entry.deadline)}`;
   else if (entry.type === "rechnung") base = `Fällig am: ${formatDate(entry.deadline)}`;
+  else if (entry.type === "sonstiges") base = `Frist/Stichtag: ${formatDate(entry.deadline)}`;
   else base = `Fristende: ${formatDate(entry.deadline)}`;
   if (entry.referenz) {
     base += ` · Ref.: ${entry.referenz}`;
@@ -728,6 +742,17 @@ document.querySelectorAll(".fw-tab").forEach((btn) => {
   });
 });
 
+const searchInput = $("#search-input");
+const sortSelect = $("#sort-select");
+searchInput.addEventListener("input", () => {
+  searchQuery = searchInput.value;
+  render();
+});
+sortSelect.addEventListener("change", () => {
+  sortMode = sortSelect.value;
+  render();
+});
+
 /* ---------- Modal: neue Frist ---------- */
 
 const overlay = $("#fw-overlay");
@@ -739,6 +764,7 @@ const DIRECT_DATE_FIELDS = {
   abo: { field: $("#field-abo"), input: $("#input-abo") },
   strafzettel: { field: $("#field-strafzettel"), input: $("#input-strafzettel") },
   rechnung: { field: $("#field-rechnung"), input: $("#input-rechnung") },
+  sonstiges: { field: $("#field-sonstiges"), input: $("#input-sonstiges") },
 };
 const erhaltenField = $("#field-erhalten");
 const erhaltenInput = $("#input-erhalten");
@@ -779,6 +805,7 @@ const REFERENZ_LABELS = {
   abo: { label: "Kundennummer (optional)", hint: "Wird, falls angegeben, im Kündigungsschreiben genannt." },
   strafzettel: { label: "Aktenzeichen / Bescheidnummer (optional)", hint: "Wird, falls angegeben, im Einspruchsschreiben genannt." },
   rechnung: { label: "Rechnungs-/Verwendungszweck-Nummer (optional)", hint: "Praktisch als Verwendungszweck bei der Überweisung." },
+  sonstiges: { label: "Referenz/Nummer (optional)", hint: "Beliebige Notiznummer, falls hilfreich." },
 };
 
 function setVisibleFields(type) {
@@ -966,7 +993,7 @@ async function runOcr(file) {
         applied.push("Anbieter");
       }
     }
-    if (!referenzTouched && (currentType === "abo" || currentType === "strafzettel" || currentType === "rechnung")) {
+    if (!referenzTouched && (REFERENZ_LABELS[currentType])) {
       const ref = parseReferenceFromText(text, currentType);
       if (ref) {
         referenzInput.value = ref;
@@ -1038,7 +1065,7 @@ form.addEventListener("submit", (e) => {
     deadline,
     betrag: betragInput.value !== "" ? Number(betragInput.value) : null,
     notiz: notizInput.value.trim(),
-    referenz: (currentType === "abo" || currentType === "strafzettel" || currentType === "rechnung") ? referenzInput.value.trim() : "",
+    referenz: (REFERENZ_LABELS[currentType]) ? referenzInput.value.trim() : "",
     adresse: (currentType === "abo" || currentType === "strafzettel") ? adresseInput.value.trim() : "",
     empfaenger: currentType === "rechnung" ? empfaengerInput.value.trim() : "",
     iban: currentType === "rechnung" ? ibanInput.value.trim().toUpperCase() : "",
@@ -1058,56 +1085,19 @@ form.addEventListener("submit", (e) => {
 
 const viewerOverlay = $("#fw-viewer-overlay");
 const viewerBox = $("#fw-viewer-content");
-let currentViewerObjectUrl = null;
-function sanitizePreviewDataUrl(value) {
-  if (typeof value !== "string") return null;
-  if (!value.startsWith("data:")) return null;
-  const m = value.match(/^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$/);
-  if (!m) return null;
-  const mime = m[1].toLowerCase();
-  if (!["application/pdf", "image/png", "image/jpeg", "image/webp", "image/gif"].includes(mime)) return null;
-  return value;
-}
-function dataUrlToObjectUrl(dataUrl) {
-  const m = dataUrl.match(/^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$/);
-  if (!m) return null;
-  const mime = m[1].toLowerCase();
-  const base64 = m[2];
-  let bin;
-  try {
-    bin = atob(base64);
-  } catch (_) {
-    return null;
-  }
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  const blob = new Blob([bytes], { type: mime });
-  return URL.createObjectURL(blob);
-}
-function clearViewerObjectUrl() {
-  if (currentViewerObjectUrl) {
-    URL.revokeObjectURL(currentViewerObjectUrl);
-    currentViewerObjectUrl = null;
-  }
-}
 function openViewer(beleg) {
   currentBeleg = beleg;
-  clearViewerObjectUrl();
   viewerBox.innerHTML = "";
   // Sicherheit: nicht dem separat mitgeführten "mime"-Feld vertrauen (das
   // könnte bei einem importierten Backup manipuliert sein), sondern den
   // echten Anfang der Data-URL selbst prüfen. Zusätzlich läuft der
   // PDF-Viewer in einem "sandbox"-iframe ohne Skriptrechte.
-  const safeDataUrl = sanitizePreviewDataUrl(beleg.dataUrl);
-  const isRealPdf = typeof safeDataUrl === "string" && safeDataUrl.startsWith("data:application/pdf;base64,");
-  const isRealImage = typeof safeDataUrl === "string" && /^data:image\/(png|jpeg|webp|gif);base64,/.test(safeDataUrl);
+  const isRealPdf = typeof beleg.dataUrl === "string" && beleg.dataUrl.startsWith("data:application/pdf");
+  const isRealImage = typeof beleg.dataUrl === "string" && /^data:image\/(png|jpe?g|webp|gif);base64,/.test(beleg.dataUrl);
 
   if (isRealPdf) {
     const iframe = document.createElement("iframe");
-    const objectUrl = dataUrlToObjectUrl(safeDataUrl);
-    if (!objectUrl) throw new Error("Ungültige Datei für Vorschau");
-    currentViewerObjectUrl = objectUrl;
-    iframe.src = objectUrl;
+    iframe.src = beleg.dataUrl;
     iframe.style.width = "80vw";
     iframe.style.height = "78vh";
     iframe.style.border = "none";
@@ -1115,10 +1105,7 @@ function openViewer(beleg) {
     viewerBox.appendChild(iframe);
   } else if (isRealImage) {
     const img = document.createElement("img");
-    const objectUrl = dataUrlToObjectUrl(safeDataUrl);
-    if (!objectUrl) throw new Error("Ungültige Datei für Vorschau");
-    currentViewerObjectUrl = objectUrl;
-    img.src = objectUrl;
+    img.src = beleg.dataUrl;
     img.className = "fw-viewer-img";
     viewerBox.appendChild(img);
   } else {
