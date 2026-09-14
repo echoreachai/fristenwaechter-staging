@@ -1106,7 +1106,7 @@ function openViewer(beleg) {
 
   if (isRealPdf) {
     const iframe = document.createElement("iframe");
-    iframe.src = beleg.dataUrl;
+    iframe.src = safeDataUrl;
     iframe.style.width = "80vw";
     iframe.style.height = "78vh";
     iframe.style.border = "none";
