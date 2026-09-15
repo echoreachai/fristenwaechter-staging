@@ -485,16 +485,87 @@ function formatEuro(amount) {
 const STORAGE_KEY = "fw_entries";
 const NOTIFIED_KEY = "fw_notified_on";
 const SENDER_KEY = "fw_sender";
+const STORAGE_SALT_KEY = "fw_entries_salt";
 
-function loadEntries() {
+function bytesToBase64(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+function base64ToBytes(b64) {
+  const s = atob(b64);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+function getStoragePassphrase() {
+  return window.prompt("Passwort zum Schutz sensibler Daten (IBAN):");
+}
+async function deriveStorageKey(passphrase, salt) {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: 150000, hash: "SHA-256" },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+async function encryptText(plain, key) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const enc = new TextEncoder().encode(plain);
+  const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc);
+  return { iv: bytesToBase64(iv), data: bytesToBase64(new Uint8Array(cipher)) };
+}
+async function decryptText(payload, key) {
+  const iv = base64ToBytes(payload.iv);
+  const data = base64ToBytes(payload.data);
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
+  return new TextDecoder().decode(plain);
+}
+async function loadEntries() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.__enc !== 1 || !Array.isArray(parsed.items)) return Array.isArray(parsed) ? parsed : [];
+    const passphrase = getStoragePassphrase();
+    if (!passphrase) return [];
+    const saltB64 = localStorage.getItem(STORAGE_SALT_KEY);
+    if (!saltB64) return [];
+    const key = await deriveStorageKey(passphrase, base64ToBytes(saltB64));
+    const out = [];
+    for (const e of parsed.items) {
+      const next = { ...e };
+      if (e.iban && e.iban.__encField) next.iban = await decryptText(e.iban.__encField, key);
+      if (e.empfaenger && e.empfaenger.__encField) next.empfaenger = await decryptText(e.empfaenger.__encField, key);
+      if (e.adresse && e.adresse.__encField) next.adresse = await decryptText(e.adresse.__encField, key);
+      out.push(next);
+    }
+    return out;
   } catch (e) { return []; }
 }
-function saveEntries(entries) {
+async function saveEntries(entries) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
+    const passphrase = getStoragePassphrase();
+    if (!passphrase) return false;
+    let saltB64 = localStorage.getItem(STORAGE_SALT_KEY);
+    if (!saltB64) {
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      saltB64 = bytesToBase64(salt);
+      localStorage.setItem(STORAGE_SALT_KEY, saltB64);
+    }
+    const key = await deriveStorageKey(passphrase, base64ToBytes(saltB64));
+    const secured = [];
+    for (const e of entries) {
+      const next = { ...e };
+      if (typeof e.iban === "string" && e.iban) next.iban = { __encField: await encryptText(e.iban, key) };
+      if (typeof e.empfaenger === "string" && e.empfaenger) next.empfaenger = { __encField: await encryptText(e.empfaenger, key) };
+      if (typeof e.adresse === "string" && e.adresse) next.adresse = { __encField: await encryptText(e.adresse, key) };
+      secured.push(next);
+    }
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ __enc: 1, items: secured }));
     return true;
   } catch (e) {
     showError("Speichern fehlgeschlagen (evtl. Speicher voll). Alte Belege ggf. löschen.");
@@ -700,7 +771,7 @@ function renderCard(entry) {
 
   card.querySelector('[data-action="toggle"]').addEventListener("click", () => {
     entry.status = entry.status === "erledigt" ? "aktiv" : "erledigt";
-    saveEntries(entries);
+    saveEntries(entries).catch(() => {});
     render();
   });
   const viewBtn = card.querySelector('[data-action="view"]');
@@ -1485,7 +1556,7 @@ $("#import-replace").addEventListener("click", () => {
 });
 function persistAndReload(next, message) {
   entries = next;
-  saveEntries(entries);
+  saveEntries(entries).catch(() => {});
   render();
   checkAndNotify(true);
   importOverlay.style.display = "none";
