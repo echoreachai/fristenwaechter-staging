@@ -1127,8 +1127,17 @@ function openViewer(beleg) {
     viewerBox.appendChild(iframe);
   } else if (isRealImage) {
     const img = document.createElement("img");
-    img.src = safeDataUrl;
+    const mimeMatch = safeDataUrl.match(/^data:(image\/(?:png|jpe?g|webp|gif));base64,/i);
+    const imageMime = mimeMatch ? mimeMatch[1].toLowerCase() : "image/png";
+    const imgBlobUrl = dataUrlToBlobUrl(safeDataUrl, imageMime);
+    img.src = imgBlobUrl;
     img.className = "fw-viewer-img";
+    img.addEventListener("load", () => {
+      URL.revokeObjectURL(imgBlobUrl);
+    }, { once: true });
+    img.addEventListener("error", () => {
+      URL.revokeObjectURL(imgBlobUrl);
+    }, { once: true });
     viewerBox.appendChild(img);
   } else {
     const p = document.createElement("p");
