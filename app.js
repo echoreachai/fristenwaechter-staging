@@ -448,6 +448,18 @@ function sanitizeImportedEntry(raw) {
   const str = (v, max) => (typeof v === "string" ? v.slice(0, max || 500) : "");
   const num = (v) => (typeof v === "number" && isFinite(v) ? v : null);
   const type = Object.keys(TYPE_META).includes(raw.type) ? raw.type : "retoure";
+  // Eine IBAN kann entweder ein Klartext-String sein oder (bei einem noch
+  // gesperrten Eintrag) das verschlüsselte Objekt — beide Formen bleiben
+  // erhalten, statt eine gesperrte IBAN beim Import stillschweigend zu
+  // verlieren.
+  const sanitizeIban = (v) => {
+    if (typeof v === "string") return v.slice(0, 40);
+    if (v && typeof v === "object" && v[STORAGE_ENC_META] === true
+      && typeof v.iv === "string" && typeof v.salt === "string" && typeof v.data === "string") {
+      return { [STORAGE_ENC_META]: true, v: 1, iv: v.iv.slice(0, 100), salt: v.salt.slice(0, 100), data: v.data.slice(0, 5000) };
+    }
+    return "";
+  };
   let beleg = null;
   if (raw.beleg && typeof raw.beleg === "object") {
     const dataUrl = typeof raw.beleg.dataUrl === "string" ? raw.beleg.dataUrl : null;
@@ -469,7 +481,7 @@ function sanitizeImportedEntry(raw) {
     referenz: str(raw.referenz, 100),
     adresse: str(raw.adresse, 500),
     empfaenger: str(raw.empfaenger, 200),
-    iban: str(raw.iban, 40),
+    iban: sanitizeIban(raw.iban),
     beleg,
     status: raw.status === "erledigt" ? "erledigt" : "aktiv",
     createdAt: str(raw.createdAt, 40) || new Date().toISOString(),
@@ -485,87 +497,165 @@ function formatEuro(amount) {
 const STORAGE_KEY = "fw_entries";
 const NOTIFIED_KEY = "fw_notified_on";
 const SENDER_KEY = "fw_sender";
-const STORAGE_SALT_KEY = "fw_entries_salt";
-
-function bytesToBase64(bytes) {
-  let s = "";
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-  return btoa(s);
+const STORAGE_ENC_META = "__enc_v1__";
+// "Gesperrt" wird aus der tatsächlichen Form von entry.iban abgeleitet
+// (noch verschlüsseltes Objekt vs. entschlüsselter String), nicht nur aus
+// einem separaten Flag — das bleibt so auch nach einem Import korrekt,
+// bei dem ein noch gesperrter Eintrag enthalten war.
+function isIbanLocked(entry) {
+  return !!(entry && entry.iban && typeof entry.iban === "object" && entry.iban[STORAGE_ENC_META] === true);
 }
-function base64ToBytes(b64) {
-  const s = atob(b64);
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+
+let storagePassphraseCache = null;
+let storagePassphraseDeclined = false; // verhindert wiederholtes Nachfragen in derselben Sitzung, wenn einmal abgebrochen
+
+function toBase64(bytes) {
+  let binary = "";
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);
+  return btoa(binary);
+}
+function fromBase64(base64) {
+  const binary = atob(base64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
   return out;
 }
-function getStoragePassphrase() {
-  return window.prompt("Passwort zum Schutz sensibler Daten (IBAN):");
+
+// Eigener, zur restlichen App passender Dialog statt window.prompt() — läuft
+// als Promise, damit er sich in die async Ver-/Entschlüsselung einfügt.
+const passphraseOverlay = $("#passphrase-overlay");
+const passphraseInput = $("#passphrase-input");
+const passphraseError = $("#passphrase-error");
+let passphraseResolver = null;
+function promptForPassphrase() {
+  return new Promise((resolve) => {
+    passphraseResolver = resolve;
+    passphraseInput.value = "";
+    passphraseError.style.display = "none";
+    passphraseOverlay.style.display = "flex";
+    passphraseInput.focus();
+  });
 }
-async function deriveStorageKey(passphrase, salt) {
+function resolvePassphrasePrompt(value) {
+  passphraseOverlay.style.display = "none";
+  if (passphraseResolver) {
+    passphraseResolver(value);
+    passphraseResolver = null;
+  }
+}
+$("#passphrase-confirm").addEventListener("click", () => {
+  const val = passphraseInput.value;
+  if (!val) {
+    passphraseError.textContent = "Bitte ein Passwort eingeben.";
+    passphraseError.style.display = "block";
+    return;
+  }
+  resolvePassphrasePrompt(val);
+});
+$("#passphrase-cancel").addEventListener("click", () => resolvePassphrasePrompt(null));
+passphraseOverlay.addEventListener("mousedown", (e) => { if (e.target === passphraseOverlay) resolvePassphrasePrompt(null); });
+
+async function getStoragePassphrase() {
+  if (storagePassphraseCache) return storagePassphraseCache;
+  if (storagePassphraseDeclined) throw new Error("Keine Passphrase angegeben.");
+  const pw = await promptForPassphrase();
+  if (!pw) {
+    storagePassphraseDeclined = true;
+    throw new Error("Keine Passphrase angegeben.");
+  }
+  storagePassphraseCache = pw;
+  return pw;
+}
+async function deriveStorageKey(passphrase, saltBytes) {
   const enc = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt, iterations: 150000, hash: "SHA-256" },
+    // Dieselbe Rundenzahl wie beim Backup-Export (siehe PBKDF2_ITERATIONS
+    // weiter unten) — ein Passwort verdient überall denselben Schutz.
+    { name: "PBKDF2", salt: saltBytes, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
     keyMaterial,
     { name: "AES-GCM", length: 256 },
     false,
     ["encrypt", "decrypt"]
   );
 }
-async function encryptText(plain, key) {
+async function encryptText(plainText) {
+  const enc = new TextEncoder();
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const enc = new TextEncoder().encode(plain);
-  const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc);
-  return { iv: bytesToBase64(iv), data: bytesToBase64(new Uint8Array(cipher)) };
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const passphrase = await getStoragePassphrase();
+  const key = await deriveStorageKey(passphrase, salt);
+  const cipherBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(plainText));
+  return {
+    v: 1,
+    iv: toBase64(iv),
+    salt: toBase64(salt),
+    data: toBase64(new Uint8Array(cipherBuf)),
+  };
 }
-async function decryptText(payload, key) {
-  const iv = base64ToBytes(payload.iv);
-  const data = base64ToBytes(payload.data);
-  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
-  return new TextDecoder().decode(plain);
+async function decryptText(payload) {
+  const dec = new TextDecoder();
+  const iv = fromBase64(payload.iv);
+  const salt = fromBase64(payload.salt);
+  const data = fromBase64(payload.data);
+  const passphrase = await getStoragePassphrase();
+  const key = await deriveStorageKey(passphrase, salt);
+  const plainBuf = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
+  return dec.decode(plainBuf);
 }
+async function protectEntryForStorage(entry) {
+  if (!entry || typeof entry !== "object") return entry;
+  if (!entry.iban || typeof entry.iban !== "string") return entry;
+  try {
+    const encrypted = await encryptText(entry.iban);
+    return { ...entry, iban: { [STORAGE_ENC_META]: true, ...encrypted } };
+  } catch (e) {
+    // Kein Passwort angegeben: IBAN bleibt für diesen Speichervorgang
+    // unverschlüsselt, statt den ganzen Eintrag zu verwerfen.
+    return entry;
+  }
+}
+// Gibt bei Fehlschlag (falsches/abgebrochenes Passwort, beschädigte Daten)
+// den Eintrag MIT verschlüsselt gebliebener IBAN zurück, statt einen Fehler
+// zu werfen — ein einzelner Entschlüsselungsfehler darf nie die restliche
+// Liste zum Verschwinden bringen.
+async function unprotectEntryFromStorage(entry) {
+  if (!entry || typeof entry !== "object") return entry;
+  const iban = entry.iban;
+  if (!iban || typeof iban !== "object" || iban[STORAGE_ENC_META] !== true) return entry;
+  try {
+    const plain = await decryptText(iban);
+    return { ...entry, iban: plain };
+  } catch (e) {
+    // Verschlüsselte Form NICHT verwerfen — sonst geht sie beim nächsten
+    // Speichern (z. B. durch Bearbeiten eines anderen Eintrags) verloren,
+    // nur weil einmal ein falsches Passwort eingegeben oder abgebrochen wurde.
+    return { ...entry, iban };
+  }
+}
+
 async function loadEntries() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!parsed || parsed.__enc !== 1 || !Array.isArray(parsed.items)) return Array.isArray(parsed) ? parsed : [];
-    const passphrase = getStoragePassphrase();
-    if (!passphrase) return [];
-    const saltB64 = localStorage.getItem(STORAGE_SALT_KEY);
-    if (!saltB64) return [];
-    const key = await deriveStorageKey(passphrase, base64ToBytes(saltB64));
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
     const out = [];
-    for (const e of parsed.items) {
-      const next = { ...e };
-      if (e.iban && e.iban.__encField) next.iban = await decryptText(e.iban.__encField, key);
-      if (e.empfaenger && e.empfaenger.__encField) next.empfaenger = await decryptText(e.empfaenger.__encField, key);
-      if (e.adresse && e.adresse.__encField) next.adresse = await decryptText(e.adresse.__encField, key);
-      out.push(next);
+    for (const e of parsed) {
+      try {
+        out.push(await unprotectEntryFromStorage(e));
+      } catch (err) {
+        out.push(e); // Im Zweifel den Eintrag unverändert behalten statt zu verlieren.
+      }
     }
     return out;
   } catch (e) { return []; }
 }
 async function saveEntries(entries) {
   try {
-    const passphrase = getStoragePassphrase();
-    if (!passphrase) return false;
-    let saltB64 = localStorage.getItem(STORAGE_SALT_KEY);
-    if (!saltB64) {
-      const salt = crypto.getRandomValues(new Uint8Array(16));
-      saltB64 = bytesToBase64(salt);
-      localStorage.setItem(STORAGE_SALT_KEY, saltB64);
-    }
-    const key = await deriveStorageKey(passphrase, base64ToBytes(saltB64));
-    const secured = [];
-    for (const e of entries) {
-      const next = { ...e };
-      if (typeof e.iban === "string" && e.iban) next.iban = { __encField: await encryptText(e.iban, key) };
-      if (typeof e.empfaenger === "string" && e.empfaenger) next.empfaenger = { __encField: await encryptText(e.empfaenger, key) };
-      if (typeof e.adresse === "string" && e.adresse) next.adresse = { __encField: await encryptText(e.adresse, key) };
-      secured.push(next);
-    }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ __enc: 1, items: secured }));
+    const toStore = [];
+    for (const e of entries) toStore.push(await protectEntryForStorage(e));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(toStore));
     return true;
   } catch (e) {
     showError("Speichern fehlgeschlagen (evtl. Speicher voll). Alte Belege ggf. löschen.");
@@ -582,7 +672,7 @@ function saveSenderData(sender) {
   localStorage.setItem(SENDER_KEY, JSON.stringify(sender));
 }
 
-let entries = loadEntries();
+let entries = [];
 let filter = "aktiv";
 let searchQuery = "";
 let sortMode = "deadline-asc";
@@ -752,7 +842,8 @@ function renderCard(entry) {
         ${entry.type === "abo" ? `<button class="fw-action" data-action="letter">Kündigung erstellen</button>` : ""}
         ${entry.type === "abo" ? `<button class="fw-action" data-action="compare">Alternativen vergleichen</button>` : ""}
         ${entry.type === "strafzettel" ? `<button class="fw-action" data-action="letter">Einspruch erstellen</button>` : ""}
-        ${entry.type === "rechnung" && entry.iban ? `<button class="fw-action" data-action="copy-iban">IBAN kopieren</button>` : ""}
+        ${entry.type === "rechnung" && entry.iban && !isIbanLocked(entry) ? `<button class="fw-action" data-action="copy-iban">IBAN kopieren</button>` : ""}
+        ${entry.type === "rechnung" && isIbanLocked(entry) ? `<button class="fw-action" data-action="unlock-iban">🔒 IBAN entsperren</button>` : ""}
         <button class="fw-action danger" data-action="delete">Löschen</button>
       </div>
     </div>
@@ -766,12 +857,14 @@ function renderCard(entry) {
   if (entry.notiz) card.querySelector(".fw-notiz").textContent = entry.notiz;
   const ibanLine = card.querySelector("#iban-line");
   if (ibanLine) {
-    ibanLine.textContent = `${entry.empfaenger ? entry.empfaenger + " · " : ""}${entry.iban}`;
+    ibanLine.textContent = isIbanLocked(entry)
+      ? `${entry.empfaenger ? entry.empfaenger + " · " : ""}🔒 IBAN gespeichert, aber gesperrt (Passwort erforderlich)`
+      : `${entry.empfaenger ? entry.empfaenger + " · " : ""}${entry.iban}`;
   }
 
   card.querySelector('[data-action="toggle"]').addEventListener("click", () => {
     entry.status = entry.status === "erledigt" ? "aktiv" : "erledigt";
-    saveEntries(entries).catch(() => {});
+    void saveEntries(entries);
     render();
   });
   const viewBtn = card.querySelector('[data-action="view"]');
@@ -792,10 +885,24 @@ function renderCard(entry) {
       }
     });
   }
+  const unlockIbanBtn = card.querySelector('[data-action="unlock-iban"]');
+  if (unlockIbanBtn) {
+    unlockIbanBtn.addEventListener("click", async () => {
+      storagePassphraseDeclined = false; // erneuten Versuch erlauben
+      try {
+        const plain = await decryptText(entry.iban);
+        entry.iban = plain;
+        render();
+      } catch (e) {
+        // Passwort weiterhin falsch/abgebrochen — Eintrag bleibt unverändert
+        // gesperrt, nichts geht dabei verloren.
+      }
+    });
+  }
   card.querySelector('[data-action="delete"]').addEventListener("click", () => {
     if (!confirm(`"${entry.produkt}" wirklich löschen?`)) return;
     entries = entries.filter((e) => e.id !== entry.id);
-    saveEntries(entries);
+    void saveEntries(entries);
     render();
   });
 
@@ -1124,7 +1231,7 @@ $("#fab-add").addEventListener("click", openModal);
 $("#btn-cancel").addEventListener("click", closeModal);
 overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closeModal(); });
 
-form.addEventListener("submit", (e) => {
+form.addEventListener("submit", async (e) => {
   e.preventDefault();
   if (!produktInput.value.trim()) return;
   const deadline = currentDeadline();
@@ -1145,7 +1252,7 @@ form.addEventListener("submit", (e) => {
     createdAt: new Date().toISOString(),
   };
   entries.unshift(entry);
-  if (saveEntries(entries)) {
+  if (await saveEntries(entries)) {
     closeModal();
     render();
     checkAndNotify(true);
@@ -1156,59 +1263,73 @@ form.addEventListener("submit", (e) => {
 
 const viewerOverlay = $("#fw-viewer-overlay");
 const viewerBox = $("#fw-viewer-content");
-function sanitizeViewerDataUrl(value) {
+function sanitizeImageDataUrl(value) {
   if (typeof value !== "string") return null;
-  const v = value.trim();
-  const pdfRe = /^data:application\/pdf;base64,[a-z0-9+/=\r\n]+$/i;
-  const imgRe = /^data:image\/(png|jpe?g|webp|gif);base64,[a-z0-9+/=\r\n]+$/i;
-  return (pdfRe.test(v) || imgRe.test(v)) ? v : null;
-}
+  const m = value.match(/^data:image\/(png|jpe?g|webp|gif);base64,([A-Za-z0-9+/=\r\n]+)$/i);
+  if (!m) return null;
+  const mime = m[1].toLowerCase();
+  const b64 = m[2].replace(/\s+/g, "");
+  if (!b64 || b64.length % 4 !== 0) return null;
 
-function dataUrlToBlobUrl(dataUrl, mimeType) {
-  const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1).replace(/\s+/g, "");
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  const blob = new Blob([bytes], { type: mimeType });
-  return URL.createObjectURL(blob);
-}
+  let bin;
+  try {
+    bin = atob(b64);
+  } catch (_) {
+    return null;
+  }
+  if (!bin || bin.length < 4) return null;
 
+  const hasPngSig =
+    bin.length >= 8 &&
+    bin.charCodeAt(0) === 0x89 &&
+    bin.charCodeAt(1) === 0x50 &&
+    bin.charCodeAt(2) === 0x4E &&
+    bin.charCodeAt(3) === 0x47 &&
+    bin.charCodeAt(4) === 0x0D &&
+    bin.charCodeAt(5) === 0x0A &&
+    bin.charCodeAt(6) === 0x1A &&
+    bin.charCodeAt(7) === 0x0A;
+  const hasJpegSig =
+    bin.length >= 3 &&
+    bin.charCodeAt(0) === 0xFF &&
+    bin.charCodeAt(1) === 0xD8 &&
+    bin.charCodeAt(2) === 0xFF;
+  const hasGifSig = bin.startsWith("GIF87a") || bin.startsWith("GIF89a");
+  const hasWebpSig =
+    bin.length >= 12 &&
+    bin.startsWith("RIFF") &&
+    bin.slice(8, 12) === "WEBP";
+
+  if (mime === "png" && !hasPngSig) return null;
+  if ((mime === "jpg" || mime === "jpeg") && !hasJpegSig) return null;
+  if (mime === "gif" && !hasGifSig) return null;
+  if (mime === "webp" && !hasWebpSig) return null;
+
+  return `data:image/${mime};base64,${b64}`;
+}
 function openViewer(beleg) {
   currentBeleg = beleg;
   viewerBox.innerHTML = "";
   // Sicherheit: nicht dem separat mitgeführten "mime"-Feld vertrauen (das
-  // könnte bei einem importierten Backup manipuliert sein), sondern eine
-  // streng validierte Allowlist-Data-URL verwenden. Zusätzlich läuft der
+  // könnte bei einem importierten Backup manipuliert sein), sondern den
+  // echten Anfang der Data-URL selbst prüfen. Zusätzlich läuft der
   // PDF-Viewer in einem "sandbox"-iframe ohne Skriptrechte.
-  const safeDataUrl = sanitizeViewerDataUrl(beleg.dataUrl);
-  const isRealPdf = typeof safeDataUrl === "string" && /^data:application\/pdf;base64,/i.test(safeDataUrl);
-  const isRealImage = typeof safeDataUrl === "string" && /^data:image\/(png|jpe?g|webp|gif);base64,/i.test(safeDataUrl);
+  const isRealPdf = typeof beleg.dataUrl === "string" && beleg.dataUrl.startsWith("data:application/pdf");
+  const safeImageDataUrl = sanitizeImageDataUrl(beleg.dataUrl);
+  const isRealImage = !!safeImageDataUrl;
 
   if (isRealPdf) {
     const iframe = document.createElement("iframe");
-    const pdfBlobUrl = dataUrlToBlobUrl(safeDataUrl, "application/pdf");
-    iframe.src = pdfBlobUrl;
+    iframe.src = beleg.dataUrl;
     iframe.style.width = "80vw";
     iframe.style.height = "78vh";
     iframe.style.border = "none";
     iframe.setAttribute("sandbox", ""); // keine Skriptausführung, keine Formulare, keine Navigation
-    iframe.addEventListener("load", () => {
-      URL.revokeObjectURL(pdfBlobUrl);
-    }, { once: true });
     viewerBox.appendChild(iframe);
   } else if (isRealImage) {
     const img = document.createElement("img");
-    const mimeMatch = safeDataUrl.match(/^data:(image\/(?:png|jpe?g|webp|gif));base64,/i);
-    const imageMime = mimeMatch ? mimeMatch[1].toLowerCase() : "image/png";
-    const imgBlobUrl = dataUrlToBlobUrl(safeDataUrl, imageMime);
-    img.src = imgBlobUrl;
+    img.src = safeImageDataUrl;
     img.className = "fw-viewer-img";
-    img.addEventListener("load", () => {
-      URL.revokeObjectURL(imgBlobUrl);
-    }, { once: true });
-    img.addEventListener("error", () => {
-      URL.revokeObjectURL(imgBlobUrl);
-    }, { once: true });
     viewerBox.appendChild(img);
   } else {
     const p = document.createElement("p");
@@ -1556,7 +1677,7 @@ $("#import-replace").addEventListener("click", () => {
 });
 function persistAndReload(next, message) {
   entries = next;
-  saveEntries(entries).catch(() => {});
+  void saveEntries(entries);
   render();
   checkAndNotify(true);
   importOverlay.style.display = "none";
@@ -1867,6 +1988,13 @@ if ("serviceWorker" in navigator) {
 
 /* ---------- Start ---------- */
 
-updateNotifBanner();
-render();
-checkAndNotify();
+// Wichtig: loadEntries() ist async (wegen der IBAN-Entschlüsselung) und
+// liefert ein Promise zurück — vorher wurde "entries" fälschlich direkt
+// auf dieses Promise gesetzt, wodurch die ganze Listenanzeige kaputt war.
+async function bootstrap() {
+  entries = await loadEntries();
+  updateNotifBanner();
+  render();
+  checkAndNotify();
+}
+bootstrap();
