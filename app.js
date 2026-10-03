@@ -13,12 +13,42 @@ function isPro() {
   return false;
 }
 
+/* ---------- Pro-Funktionen: zentrale Steuerung ----------
+   PRO_GATING_ENABLED bleibt auf false, solange der Kauf über Google Play /
+   App Store noch nicht eingebaut ist — sonst würden Nutzer ab dem 11.
+   Eintrag ausgesperrt, ohne bezahlen zu können. Dann sind alle
+   Pro-Funktionen für alle frei nutzbar. Zum Testen der Sperren im
+   Staging-Repo einfach auf true setzen. */
+const PRO_GATING_ENABLED = false;
+const FREE_ENTRY_LIMIT = 10; // Anzahl nicht erledigter Einträge in der Gratis-Version
+function hasProAccess() {
+  return !PRO_GATING_ENABLED || isPro();
+}
+// Produkt-IDs — müssen exakt so in der Google Play Console und in App
+// Store Connect angelegt werden. Die Preise kommen später live aus dem
+// Store (lokalisiert); die fallbackPrice-Texte werden nur angezeigt,
+// solange die Store-Anbindung noch fehlt.
+const PRO_PRODUCTS = {
+  yearly: { id: "fristenwaechter_pro_yearly", fallbackPrice: "9,99 € / Jahr" },
+  monthly: { id: "fristenwaechter_pro_monthly", fallbackPrice: "0,99 € / Monat" },
+};
+
 /* ---------- Datumshilfen & Feiertagslogik (Deutschland / NRW) ---------- */
 
 function pad(n) { return String(n).padStart(2, "0"); }
 function toISO(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
 function parseISO(s) { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); }
 function addDays(date, n) { const d = new Date(date); d.setDate(d.getDate() + n); return d; }
+// Monate addieren, Monatsende sicher: 31.01. + 1 Monat = 28./29.02. (nicht 03.03.)
+function addMonths(date, n) {
+  const d = new Date(date);
+  const day = d.getDate();
+  d.setDate(1);
+  d.setMonth(d.getMonth() + n);
+  const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+  d.setDate(Math.min(day, lastDay));
+  return d;
+}
 function isWeekend(d) { const day = d.getDay(); return day === 0 || day === 6; }
 
 function easterSunday(year) {
@@ -479,6 +509,9 @@ function sanitizeImportedEntry(raw) {
     produkt: str(raw.produkt, 200) || "Ohne Titel",
     erhalten: str(raw.erhalten, 10),
     kaufdatum: str(raw.kaufdatum, 10) || null,
+    intervall: ["monatlich", "jaehrlich", "einmalig"].includes(raw.intervall) ? raw.intervall : null,
+    serie: raw.serie === true,
+    erledigtAm: /^\d{4}-\d{2}-\d{2}$/.test(raw.erledigtAm || "") ? raw.erledigtAm : null,
     garantieJahre: (typeof raw.garantieJahre === "number" && raw.garantieJahre >= 0 && raw.garantieJahre <= 30) ? raw.garantieJahre : null,
     deadline: str(raw.deadline, 10) || toISO(new Date()),
     betrag: num(raw.betrag),
@@ -572,12 +605,69 @@ const statGarantie = $("#stat-garantie");
 const statGarantieBtn = $("#stat-garantie-btn");
 const garantieOverlay = $("#garantie-overlay");
 const garantieList = $("#garantie-list");
+const statSavings = $("#stat-savings");
+const statSavingsBtn = $("#stat-savings-btn");
+const statSavingsLabel = $("#stat-savings-label");
+const proOverlay = $("#pro-overlay");
+const proReason = $("#pro-reason");
+const proStatus = $("#pro-status");
 const errorBox = $("#fw-error");
 
 function showError(msg) {
   errorBox.textContent = msg;
   errorBox.style.display = "block";
   setTimeout(() => { errorBox.style.display = "none"; }, 5000);
+}
+
+/* ---------- Pro: Ersparnis, Serien, Eintragslimit ---------- */
+
+// Ersparnis dieses Jahr: Abos, die rechtzeitig (am oder vor dem
+// Fristende) als erledigt = gekündigt markiert wurden. Gezählt wird der
+// vermiedene Jahresbetrag: monatlich × 12, jährlich bzw. einmalig × 1.
+// Zugeordnet wird dem Jahr, in dem gekündigt wurde.
+const INTERVALL_FAKTOR = { monatlich: 12, jaehrlich: 1, einmalig: 1 };
+function computeSavingsThisYear() {
+  const year = String(new Date().getFullYear());
+  return entries.reduce((sum, e) => {
+    if (e.type !== "abo" || e.status !== "erledigt" || !e.erledigtAm) return sum;
+    if (!e.erledigtAm.startsWith(year)) return sum;
+    if (e.erledigtAm > e.deadline) return sum; // zu spät gekündigt -> keine Ersparnis
+    const betrag = Number(e.betrag);
+    if (!betrag || !isFinite(betrag)) return sum;
+    return sum + betrag * (INTERVALL_FAKTOR[e.intervall] || 1);
+  }, 0);
+}
+
+// Abo-Serien: Ist die Frist eines laufenden Serien-Abos verstrichen, ohne
+// dass gekündigt wurde, springt sie um ein Intervall weiter (so oft wie
+// nötig, falls die App länger nicht geöffnet war). Gibt true zurück, wenn
+// sich etwas geändert hat.
+function advanceSeries() {
+  if (!hasProAccess()) return false;
+  const today = toISO(new Date());
+  let changed = false;
+  for (const e of entries) {
+    if (e.type !== "abo" || !e.serie || e.status === "erledigt") continue;
+    const step = e.intervall === "jaehrlich" ? 12 : e.intervall === "monatlich" ? 1 : 0;
+    if (!step || !e.deadline) continue;
+    let guard = 0;
+    while (e.deadline < today && guard < 600) {
+      e.deadline = toISO(addMonths(parseISO(e.deadline), step));
+      guard++;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function countOpenEntries() {
+  return entries.filter((e) => e.status !== "erledigt").length;
+}
+
+function openProPaywall(reason) {
+  proReason.textContent = reason || "Schalte alle Pro-Funktionen frei:";
+  proStatus.style.display = "none";
+  proOverlay.style.display = "flex";
 }
 
 function sortEntries(list, mode) {
@@ -599,6 +689,18 @@ function sortEntries(list, mode) {
 }
 
 function render() {
+  if (advanceSeries()) saveEntries(entries);
+
+  const year = new Date().getFullYear();
+  statSavingsLabel.textContent = `💶 Gespart ${year}`;
+  if (hasProAccess()) {
+    statSavings.textContent = formatEuro(computeSavingsThisYear());
+    statSavingsBtn.classList.remove("is-locked");
+  } else {
+    statSavings.textContent = "🔒";
+    statSavingsBtn.classList.add("is-locked");
+  }
+
   // Garantien laufen als eigener Bereich (Garantie-Archiv) getrennt von
   // den übrigen Fristen — sie tauchen weder in der Hauptliste noch in den
   // Dringend/Bald/Aktiv/Gesamt-Zahlen oben auf.
@@ -676,7 +778,10 @@ function stampSVG(status, dleft) {
 function metaLine(entry) {
   let base;
   if (entry.type === "retoure") base = `Erhalten: ${formatDate(entry.erhalten)} · Fristende: ${formatDate(entry.deadline)}`;
-  else if (entry.type === "abo") base = `Frist/Stichtag: ${formatDate(entry.deadline)}`;
+  else if (entry.type === "abo") {
+    const intervallLabel = { monatlich: "monatlich", jaehrlich: "jährlich", einmalig: "einmalig" }[entry.intervall];
+    base = `Frist/Stichtag: ${formatDate(entry.deadline)}${intervallLabel ? ` · ${intervallLabel}` : ""}${entry.serie ? " · 🔁 Serie" : ""}`;
+  }
   else if (entry.type === "strafzettel") base = `Zahlungs-/Einspruchsfrist: ${formatDate(entry.deadline)}`;
   else if (entry.type === "rechnung") base = `Fällig am: ${formatDate(entry.deadline)}`;
   else if (entry.type === "sonstiges") base = `Frist/Stichtag: ${formatDate(entry.deadline)}`;
@@ -738,7 +843,18 @@ function renderCard(entry) {
   }
 
   card.querySelector('[data-action="toggle"]').addEventListener("click", () => {
-    entry.status = entry.status === "erledigt" ? "aktiv" : "erledigt";
+    if (entry.status === "erledigt") {
+      // Wieder aktivieren erhöht die Zahl offener Einträge -> Limit beachten
+      if (!hasProAccess() && countOpenEntries() >= FREE_ENTRY_LIMIT) {
+        openProPaywall(`Die Gratis-Version erlaubt ${FREE_ENTRY_LIMIT} offene Einträge.`);
+        return;
+      }
+      entry.status = "aktiv";
+      entry.erledigtAm = null;
+    } else {
+      entry.status = "erledigt";
+      entry.erledigtAm = toISO(new Date());
+    }
     saveEntries(entries);
     render();
   });
@@ -821,6 +937,9 @@ const fieldZahlung = $("#field-zahlung");
 const empfaengerInput = $("#input-empfaenger");
 const ibanInput = $("#input-iban");
 const fieldGarantie = $("#field-garantie");
+const intervallInput = $("#input-intervall");
+const serieInput = $("#input-serie");
+const serieRow = $("#serie-row");
 const formTitle = $("#fw-form-title");
 const fieldArt = $("#field-art");
 const kaufdatumInput = $("#input-kaufdatum");
@@ -892,6 +1011,10 @@ function setVisibleFields(type) {
 }
 
 function openModal(presetType) {
+  if (!hasProAccess() && countOpenEntries() >= FREE_ENTRY_LIMIT) {
+    openProPaywall(`Die Gratis-Version erlaubt ${FREE_ENTRY_LIMIT} offene Einträge. Erledigte Einträge zählen nicht mit.`);
+    return;
+  }
   currentType = presetType || "retoure";
   currentBelegDraft = null;
   currentBelegPages = [];
@@ -917,6 +1040,9 @@ function openModal(presetType) {
   erhaltenInput.value = toISO(new Date());
   kaufdatumInput.value = toISO(new Date());
   garantiedauerInput.value = "2";
+  intervallInput.value = "monatlich";
+  serieInput.checked = false;
+  serieRow.classList.toggle("is-locked", !hasProAccess());
   Object.values(DIRECT_DATE_FIELDS).forEach(({ input }) => { input.value = toISO(addDays(new Date(), 14)); });
   fileInput.value = "";
   fileAddPageInput.value = "";
@@ -969,6 +1095,19 @@ typeOpts.forEach((opt) => {
 });
 erhaltenInput.addEventListener("input", () => { dateTouched = true; });
 kaufdatumInput.addEventListener("input", () => { dateTouched = true; });
+serieInput.addEventListener("change", () => {
+  if (!hasProAccess()) {
+    serieInput.checked = false;
+    openProPaywall("Abo-Serien sind eine Pro-Funktion.");
+    return;
+  }
+  if (intervallInput.value === "einmalig") {
+    serieInput.checked = false;
+  }
+});
+intervallInput.addEventListener("change", () => {
+  if (intervallInput.value === "einmalig") serieInput.checked = false;
+});
 kaufdatumInput.addEventListener("change", updatePreview);
 garantiedauerInput.addEventListener("input", updatePreview);
 erhaltenInput.addEventListener("change", updatePreview);
@@ -1226,6 +1365,11 @@ overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closeMo
 form.addEventListener("submit", (e) => {
   e.preventDefault();
   if (!produktInput.value.trim()) return;
+  if (!hasProAccess() && countOpenEntries() >= FREE_ENTRY_LIMIT) {
+    closeModal();
+    openProPaywall(`Die Gratis-Version erlaubt ${FREE_ENTRY_LIMIT} offene Einträge.`);
+    return;
+  }
   const deadline = currentDeadline();
   const entry = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1234,6 +1378,9 @@ form.addEventListener("submit", (e) => {
     erhalten: currentType === "retoure" ? erhaltenInput.value : null,
     kaufdatum: currentType === "garantie" ? kaufdatumInput.value : null,
     garantieJahre: currentType === "garantie" ? Number(garantiedauerInput.value) || 0 : null,
+    intervall: currentType === "abo" ? intervallInput.value : null,
+    serie: currentType === "abo" && hasProAccess() && serieInput.checked && intervallInput.value !== "einmalig",
+    erledigtAm: null,
     deadline,
     betrag: betragInput.value !== "" ? Number(betragInput.value) : null,
     notiz: notizInput.value.trim(),
@@ -1779,6 +1926,28 @@ statGarantieBtn.addEventListener("click", openGarantieArchiv);
 $("#garantie-close").addEventListener("click", () => { garantieOverlay.style.display = "none"; });
 garantieOverlay.addEventListener("mousedown", (e) => { if (e.target === garantieOverlay) garantieOverlay.style.display = "none"; });
 $("#btn-add-garantie").addEventListener("click", () => openModal("garantie"));
+
+/* ---- Pro-Fenster (Paywall) ---- */
+$("#pro-close").addEventListener("click", () => { proOverlay.style.display = "none"; });
+proOverlay.addEventListener("mousedown", (e) => { if (e.target === proOverlay) proOverlay.style.display = "none"; });
+let selectedPlan = "yearly";
+document.querySelectorAll(".fw-plan").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    selectedPlan = btn.dataset.plan;
+    document.querySelectorAll(".fw-plan").forEach((b) => b.classList.toggle("is-selected", b === btn));
+  });
+});
+$("#pro-buy").addEventListener("click", () => {
+  // Platzhalter: Hier wird später der Kauf von PRO_PRODUCTS[selectedPlan].id
+  // über Google Play Billing bzw. StoreKit (iOS) gestartet.
+  proStatus.textContent = "Der Kauf ist noch nicht verfügbar — Pro kommt in Kürze.";
+  proStatus.style.display = "block";
+});
+statSavingsBtn.addEventListener("click", () => {
+  if (!hasProAccess()) {
+    openProPaywall("Die Ersparnis-Auswertung ist eine Pro-Funktion.");
+  }
+});
 
 /* ---- Kündigungs-/Einspruchsschreiben als PDF ----
    Erzeugt eine fertig formatierte Brief-Vorlage (DIN-5008-ähnlich) direkt

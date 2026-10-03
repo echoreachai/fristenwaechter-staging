@@ -55,6 +55,10 @@
         <div class="fw-stat-num" id="stat-garantie">0</div>
         <div class="fw-stat-label">🛡️ Garantien</div>
       </button>
+      <button class="fw-stat fw-stat-clickable fw-stat-savings" id="stat-savings-btn" type="button">
+        <div class="fw-stat-num" id="stat-savings">0 €</div>
+        <div class="fw-stat-label" id="stat-savings-label">💶 Gespart</div>
+      </button>
     </div>
   </header>
 
@@ -135,6 +139,18 @@
           <label class="fw-label" for="input-abo">Kündigungsfrist / Stichtag</label>
           <input type="date" class="fw-input" id="input-abo" />
           <p class="fw-hint">Trage den letzten Tag ein, an dem du kündigen kannst — laut deinem Vertrag.</p>
+          <label class="fw-label" for="input-intervall" style="margin-top:12px">Zahlungsintervall</label>
+          <select class="fw-input" id="input-intervall">
+            <option value="monatlich">Monatlich</option>
+            <option value="jaehrlich">Jährlich</option>
+            <option value="einmalig">Einmalig</option>
+          </select>
+          <p class="fw-hint">Wird für die Ersparnis-Auswertung genutzt — der Betrag oben gilt pro Intervall.</p>
+          <label class="fw-check-row" id="serie-row">
+            <input type="checkbox" id="input-serie" />
+            <span>🔁 Als Serie fortsetzen <span class="fw-pro-badge">PRO</span></span>
+          </label>
+          <p class="fw-hint">Wenn du bis zur Frist nicht kündigst, springt die Frist automatisch ein Intervall weiter — der Zähler startet neu.</p>
         </div>
 
         <div class="fw-field" id="field-strafzettel" style="display:none">
@@ -307,6 +323,37 @@
       <div class="fw-modal-actions">
         <button type="button" class="fw-btn-secondary" id="compare-close" style="flex:1">Schließen</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Pro-Freischaltung (Paywall) -->
+  <div class="fw-overlay" id="pro-overlay" style="display:none">
+    <div class="fw-modal">
+      <h2 class="fw-modal-title">Fristen-Wächter <span class="fw-pro-badge">PRO</span></h2>
+      <p class="fw-modal-sub" id="pro-reason"></p>
+      <ul class="fw-pro-list">
+        <li><strong>Unbegrenzte Einträge</strong> — statt 10 offener Einträge in der Gratis-Version</li>
+        <li><strong>Ersparnis-Auswertung</strong> — direkt im Dashboard sehen, wie viel du dieses Jahr durch rechtzeitige Kündigungen gespart hast</li>
+        <li><strong>Abo-Serien</strong> — laufende Abos setzen ihre Frist automatisch jedes Intervall neu</li>
+      </ul>
+      <div class="fw-plan-options">
+        <button type="button" class="fw-plan is-selected" data-plan="yearly">
+          <span class="fw-plan-name">Jährlich</span>
+          <span class="fw-plan-price" id="price-yearly">9,99 € / Jahr</span>
+          <span class="fw-plan-note">16 % günstiger als monatlich</span>
+        </button>
+        <button type="button" class="fw-plan" data-plan="monthly">
+          <span class="fw-plan-name">Monatlich</span>
+          <span class="fw-plan-price" id="price-monthly">0,99 € / Monat</span>
+          <span class="fw-plan-note">monatlich kündbar</span>
+        </button>
+      </div>
+      <p class="fw-hint" id="pro-price-hint">Verlängert sich automatisch, jederzeit im Store kündbar.</p>
+      <div class="fw-modal-actions">
+        <button type="button" class="fw-btn-secondary" id="pro-close">Später</button>
+        <button type="button" class="fw-btn-primary" id="pro-buy">Pro freischalten</button>
+      </div>
+      <p class="fw-hint" id="pro-status" style="display:none"></p>
     </div>
   </div>
 

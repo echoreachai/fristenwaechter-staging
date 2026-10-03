@@ -113,6 +113,40 @@ Während ein Foto/PDF gelesen wird, zeigt die App jetzt einen auffälligen
 Hinweis mit Lade-Spinner (statt eines kleinen grauen Texthinweises) —
 leichter zu erkennen, dass die Erkennung noch läuft.
 
+## Pro-Funktionen (vorbereitet, Bezahlung folgt)
+
+Drei Pro-Funktionen sind eingebaut. Gesteuert wird alles oben in `app.js`:
+
+- `PRO_GATING_ENABLED` — steht auf **false**, solange der Kauf über Google
+  Play / App Store noch nicht eingebaut ist. Dann sind alle Funktionen für
+  alle frei, niemand wird ausgesperrt. Zum Testen der Sperren im
+  Staging-Repo auf `true` setzen.
+- `FREE_ENTRY_LIMIT` — Anzahl offener Einträge in der Gratis-Version (10).
+- `isPro()` — wird später gegen den echten Abo-Status getauscht.
+
+**1. Unbegrenzte Einträge:** Gratis sind 10 offene Einträge möglich.
+Erledigte Einträge zählen nicht mit, Garantien schon. Beim 11. erscheint
+das Pro-Fenster.
+
+**2. Ersparnis-Auswertung:** Kachel "💶 Gespart <Jahr>" im Dashboard. Gezählt
+werden Abos, die rechtzeitig (am oder vor dem Fristende) als erledigt =
+gekündigt markiert wurden: monatlicher Betrag × 12, jährlicher bzw.
+einmaliger Betrag × 1, dem Jahr der Kündigung zugeordnet. Dafür gibt es bei
+Abos das neue Feld "Zahlungsintervall"; beim Abhaken wird das Datum
+gespeichert.
+
+**3. Abo-Serien:** Checkbox "🔁 Als Serie fortsetzen" bei Abos. Verstreicht
+die Frist ohne Kündigung, springt sie automatisch ein Intervall weiter
+(Monatsenden korrekt, z. B. 31.01. → 28.02.). War die App länger zu, wird
+entsprechend mehrfach weitergesetzt.
+
+**Tarife:** 9,99 € / Jahr (vorausgewählt) oder 0,99 € / Monat. Produkt-IDs
+in `PRO_PRODUCTS` (app.js): `fristenwaechter_pro_yearly` und
+`fristenwaechter_pro_monthly` — exakt so in beiden Store-Konsolen anlegen.
+
+Der Button "Pro freischalten" ist ein Platzhalter, bis Play Billing bzw.
+StoreKit angebunden sind.
+
 ## Garantie-Archiv
 
 Eigener Bereich für Kaufbelege und Garantiefristen — bewusst getrennt von
