@@ -19,7 +19,7 @@ function isPro() {
    Eintrag ausgesperrt, ohne bezahlen zu können. Dann sind alle
    Pro-Funktionen für alle frei nutzbar. Zum Testen der Sperren im
    Staging-Repo einfach auf true setzen. */
-const PRO_GATING_ENABLED = false;
+const PRO_GATING_ENABLED = true;
 const FREE_ENTRY_LIMIT = 10; // Anzahl nicht erledigter Einträge in der Gratis-Version
 function hasProAccess() {
   return !PRO_GATING_ENABLED || isPro();
