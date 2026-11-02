@@ -688,3 +688,44 @@ body{
 .fw-plan-name{ font-size: 12px; font-weight: 700; color: var(--slate); text-transform: uppercase; letter-spacing: 0.5px; }
 .fw-plan-price{ font-family: var(--font-mono); font-size: 15px; font-weight: 800; }
 .fw-plan-note{ font-size: 11px; color: var(--green); font-weight: 600; }
+
+/* ---------- Pro / In-App-Kauf (iOS) ---------- */
+.fw-link-btn{
+  background: none; border: none; padding: 4px 2px;
+  color: var(--ink); font: inherit; font-size: 12.5px;
+  text-decoration: underline; cursor: pointer;
+}
+.fw-link-btn:disabled{ opacity: 0.5; cursor: default; }
+#pro-restore{ display: block; margin: 10px auto 0; }
+.fw-pro-terms{ font-size: 10.5px; line-height: 1.45; color: var(--slate); margin: 10px 0 0; }
+.fw-pro-legal{ text-align: center; font-size: 11.5px; color: var(--slate); margin: 10px 0 0; }
+.fw-pro-legal .fw-link-btn{ font-size: 11.5px; color: var(--slate); }
+.fw-pro-active{ font-size: 15px; font-weight: 700; color: var(--green); margin: 4px 0 6px; }
+.fw-pro-status{ font-size: 12.5px; color: var(--ink); text-align: center; margin-top: 10px; }
+.fw-btn-primary:disabled, .fw-btn-secondary:disabled{ opacity: 0.6; cursor: default; }
+.fw-toast{
+  position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+  transform: translate(-50%, 20px); opacity: 0; pointer-events: none;
+  background: var(--ink); color: #fff; padding: 10px 16px; border-radius: 10px;
+  font-size: 13.5px; font-weight: 600; box-shadow: 0 6px 20px rgba(0,0,0,0.2);
+  transition: opacity .2s, transform .2s; z-index: 2000; max-width: calc(100% - 32px);
+}
+.fw-toast.is-visible{ opacity: 1; transform: translate(-50%, 0); }
+/* Overlays nicht unter Notch / Dynamic Island / Home-Indikator */
+.fw-overlay{
+  padding-top: max(24px, env(safe-area-inset-top, 0px));
+  padding-bottom: max(24px, env(safe-area-inset-bottom, 0px));
+}
+
+/* Weitere Belegseiten: Kamera und Galerie getrennt */
+.fw-addpage-row{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.fw-addpage-row .fw-action{ font-size: 12px; padding: 8px 12px; }
+
+/* Beleg-Viewer: Zoom per Tippen statt Seiten-Zoom */
+.fw-viewer-img{ cursor: zoom-in; touch-action: pan-x pan-y; }
+.fw-viewer-img.is-zoomed{ max-width: none; max-height: none; width: 230%; cursor: zoom-out; }
+.fw-viewer-scroll{ overflow: auto; -webkit-overflow-scrolling: touch; max-height: 74vh; max-width: 86vw; }
+.fw-viewer-actions{ display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; }
+.fw-viewer-actions .fw-action{ font-size: 13px; padding: 8px 12px; }
+
+.fw-menu-version{ padding: 8px 16px 10px; font-size: 11px; color: var(--slate); border-top: 1px solid var(--line); }

@@ -1,4 +1,4 @@
-const CACHE_NAME = "fristen-waechter-v4";
+const CACHE_NAME = "fristen-waechter-v6";
 const CORE_ASSETS = [
   "./",
   "./index.html",

@@ -1,16 +1,160 @@
 "use strict";
 
-/* ---------- Pro-Status (Stub) ----------
-   Platzhalter für den späteren Play-Billing-Ausbau. Gibt aktuell IMMER
-   false zurück — jeder Nutzer ist also frei. Sobald Play Billing
-   (Digital Goods API) angebunden ist, wird NUR diese eine Funktion
-   ersetzt (z. B. durch eine Abfrage der Kaufhistorie über
-   window.getDigitalGoodsService(...) bzw. ein serverseitig verifiziertes
-   Entitlement) — der Rest der App muss dafür nicht angefasst werden.
-   Feature-Gating später einfach so einbauen: if (!isPro()) { ... Hinweis
-   auf Pro-Upgrade zeigen ... }. */
+/* ---------- Pro-Status & In-App-Kauf ----------
+   Diese Version wird für die iOS-App gebaut (Codemagic kopiert den Ordner
+   ios-web/ über die Web-Dateien). Gekauft wird über Apples StoreKit 2 mit
+   dem Capacitor-Plugin @capgo/native-purchases. Die Kaufprüfung passiert
+   auf dem Gerät durch StoreKit; es gibt keinen eigenen Server.
+
+   Läuft derselbe Code im Browser oder in der Android-App (kein
+   iOS-Plugin), ist das Gating aus: dann sind alle Pro-Funktionen frei,
+   genau wie bisher. */
+const PRO_PRODUCTS = {
+  yearly: { id: "fristenwaechter_pro_yearly", fallbackPrice: "9,99 € / Jahr", unit: "Jahr" },
+  monthly: { id: "fristenwaechter_pro_monthly", fallbackPrice: "0,99 € / Monat", unit: "Monat" },
+};
+const PRO_PRODUCT_IDS = Object.values(PRO_PRODUCTS).map((p) => p.id);
+const PRO_CACHE_KEY = "fw_pro_cache";
+const APPLE_EULA_URL = "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/";
+const PRIVACY_URL = "https://echoreachai.github.io/fristenwaechter/datenschutz.html";
+const IMPRINT_URL = "https://echoreachai.github.io/fristenwaechter/impressum.html";
+
+// Stand der iOS-Webdateien — steht unten im Menü, damit man in TestFlight
+// sofort sieht, ob der neue Build läuft.
+const APP_WEB_VERSION = "2026-11-02";
+
+// In der iOS-App stellt die Capacitor-Bridge nur window.Capacitor.nativePromise
+// bereit. Capacitor.registerPlugin() gibt es dort NICHT — das kommt aus dem
+// npm-Paket @capacitor/core, das diese App (ohne Bundler) nicht einbindet.
+// Daher ein eigener kleiner Plugin-Zugriff über nativePromise.
+function isIosNativeApp() {
+  try {
+    const cap = window.Capacitor;
+    return !!(cap && typeof cap.isNativePlatform === "function" && cap.isNativePlatform() &&
+      typeof cap.getPlatform === "function" && cap.getPlatform() === "ios" &&
+      (typeof cap.nativePromise === "function" || typeof cap.registerPlugin === "function"));
+  } catch (err) {
+    return false;
+  }
+}
+const IS_IOS_APP = isIosNativeApp();
+function nativePlugin(name) {
+  const cap = window.Capacitor;
+  if (typeof cap.registerPlugin === "function") return cap.registerPlugin(name);
+  return new Proxy({}, {
+    get(_, method) {
+      if (method === "then" || typeof method !== "string") return undefined;
+      if (method === "addListener") {
+        return (eventName, callback) => Promise.resolve(
+          typeof cap.addListener === "function" ? cap.addListener(name, eventName, callback) : null);
+      }
+      return (options) => cap.nativePromise(name, method, options || {});
+    },
+  });
+}
+const Store = IS_IOS_APP ? nativePlugin("NativePurchases") : null;
+
+// Gating nur in der iOS-App, wo man auch kaufen kann.
+// ---- Google Play Billing (Android-App = Trusted Web Activity) ----
+// Die Android-App öffnet die Webseite in Chrome als „Trusted Web Activity“.
+// Gekauft wird dort über die Digital Goods API + Payment Request von Chrome,
+// die Play-Billing-Bibliothek steckt in der Android-Hülle (Ordner android/).
+// Bestätigt ("acknowledge") werden Käufe ebenfalls von der Android-Hülle.
+const PLAY_BILLING_METHOD = "https://play.google.com/billing";
+const ANDROID_PACKAGE = "com.echoreach.fristenwaechter";
+const PLAY_OK_KEY = "fw_play_ok";
+// Die App startet die Seite mit Referrer "android-app://<paket>"; danach hält
+// sessionStorage (nur dieser App-Tab, nicht der normale Browser) das fest.
+const IS_ANDROID_TWA = (() => {
+  if (IS_IOS_APP) return false;
+  try {
+    if (document.referrer && document.referrer.startsWith("android-app://" + ANDROID_PACKAGE)) {
+      sessionStorage.setItem("fw_twa", "1");
+      return true;
+    }
+    return sessionStorage.getItem("fw_twa") === "1";
+  } catch (err) {
+    return false;
+  }
+})();
+let playService = null;
+// War Play Billing beim letzten Start verfügbar, gilt das Gating sofort (kein
+// kurzes Aufblitzen freier Pro-Funktionen); bestätigt wird es in initPlayBilling().
+let playBillingReady = IS_ANDROID_TWA && typeof window.getDigitalGoodsService === "function" && (() => {
+  try { return localStorage.getItem(PLAY_OK_KEY) === "1"; } catch (err) { return false; }
+})();
+// Gating nur dort, wo man auch kaufen kann (iOS-App, Android-App mit Play Billing).
+// Im normalen Browser bleiben alle Pro-Funktionen frei.
+function proGatingEnabled() {
+  return IS_IOS_APP || playBillingReady;
+}
+const FREE_ENTRY_LIMIT = 10; // Anzahl nicht erledigter Einträge in der Gratis-Version
+
+// Letzter bekannter Status aus StoreKit, damit Pro auch offline sofort
+// aktiv ist. Wird bei jedem Start und nach Käufen frisch abgefragt.
+let proActive = (() => {
+  try {
+    const c = JSON.parse(localStorage.getItem(PRO_CACHE_KEY) || "null");
+    if (!c || !c.active) return false;
+    if (c.until && new Date(c.until).getTime() + 3 * 86400000 < Date.now()) return false;
+    return true;
+  } catch (err) { return false; }
+})();
+let proUntil = null;
+
 function isPro() {
-  return false;
+  return proActive;
+}
+
+/* ---------- Dateien ausgeben (PDF-Schreiben, Backup, Belege) ----------
+   Die iOS-Webansicht (WKWebView) kann keine Browser-Downloads ("<a download>"
+   bzw. jsPDF doc.save) — dort passierte beim Tippen einfach nichts. In der
+   iOS-App wird die Datei deshalb im App-Cache gespeichert und über das
+   iOS-Teilen-Menü angeboten (Sichern in „Dateien“, Drucken, Mail, AirDrop …).
+   Im Browser/Android bleibt es beim normalen Download. */
+const NativeFs = IS_IOS_APP ? nativePlugin("Filesystem") : null;
+const NativeShare = IS_IOS_APP ? nativePlugin("Share") : null;
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(",")[1] || "");
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
+}
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+async function deliverFile(blob, filename, title) {
+  if (!NativeFs || !NativeShare) {
+    downloadBlob(blob, filename);
+    return;
+  }
+  const data = await blobToBase64(blob);
+  const res = await NativeFs.writeFile({ path: filename, data, directory: "CACHE" });
+  try {
+    await NativeShare.share({ title: title || filename, files: [res.uri] });
+  } catch (err) {
+    if (/cancel/i.test(String((err && err.message) || err))) return; // Nutzer hat das Menü geschlossen
+    throw err;
+  }
+}
+function fileErrorMessage(err) {
+  const msg = String((err && err.message) || err || "");
+  if (/not implemented|unimplemented|not available/i.test(msg)) {
+    return "Diese App-Version kann noch keine Dateien teilen. Bitte installiere das neueste Update.";
+  }
+  return "Die Datei konnte nicht geteilt werden. Bitte versuche es erneut.";
+}
+function hasProAccess() {
+  return !proGatingEnabled() || isPro();
 }
 
 /* ---------- Datumshilfen & Feiertagslogik (Deutschland / NRW) ---------- */
@@ -19,6 +163,16 @@ function pad(n) { return String(n).padStart(2, "0"); }
 function toISO(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
 function parseISO(s) { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); }
 function addDays(date, n) { const d = new Date(date); d.setDate(d.getDate() + n); return d; }
+// Monate addieren, Monatsende sicher: 31.01. + 1 Monat = 28./29.02. (nicht 03.03.)
+function addMonths(date, n) {
+  const d = new Date(date);
+  const day = d.getDate();
+  d.setDate(1);
+  d.setMonth(d.getMonth() + n);
+  const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+  d.setDate(Math.min(day, lastDay));
+  return d;
+}
 function isWeekend(d) { const day = d.getDay(); return day === 0 || day === 6; }
 
 function easterSunday(year) {
@@ -211,6 +365,16 @@ const DATE_KEYWORD_TIERS_BY_TYPE = {
   ],
   sonstiges: [
     ["frist", "stichtag", "fällig", "faellig", "termin"],
+    ["datum"],
+  ],
+  versicherung: [
+    ["hauptfälligkeit", "hauptfaelligkeit", "hauptfällig", "vertragsablauf", "ablauf", "versicherungsjahr endet", "verlängert sich", "verlaengert sich"],
+    ["versicherungsperiode", "versicherungszeitraum", "bis zum", "endet am"],
+    ["datum"],
+  ],
+  festgeld: [
+    ["fälligkeit", "faelligkeit", "fällig am", "faellig am", "laufzeitende", "ende der laufzeit", "rückzahlung", "rueckzahlung", "laufzeit bis"],
+    ["laufzeit", "bis zum", "endet am"],
     ["datum"],
   ],
   garantie: [
@@ -796,7 +960,44 @@ const REFERENCE_KEYWORDS_BY_TYPE = {
   rechnung: ["rechnungsnummer", "rechnungs-nr", "rechnungsnr", "rechnung\\s*nr\\.?", "rg-nr", "belegnummer", "beleg-nr", "verwendungszweck", "referenznummer", "kundennummer", "kd-nr", "kdnr"],
   abo: ["kundennummer", "kd-nr", "kdnr", "vertragsnummer", "mitgliedsnummer", "mitgliedsnr"],
   strafzettel: ["aktenzeichen", "bescheidnummer", "geschäftszeichen", "geschaeftszeichen", "vorgangsnummer"],
+  versicherung: ["versicherungsschein-?n(?:umme)?r\\.?", "versicherungsscheinnummer", "versicherungs-?n(?:umme)?r\\.?", "vertrags-?n(?:umme)?r\\.?", "policen-?n(?:umme)?r\\.?", "vers\\.?-?nr\\.?", "vsnr\\.?"],
+  festgeld: ["festgeldkonto", "anlagekonto", "konto-?n(?:umme)?r\\.?", "kontonummer", "vertrags-?n(?:umme)?r\\.?", "anlage-?n(?:umme)?r\\.?"],
 };
+
+// Versicherung/Festgeld: zusätzliche Angaben aus dem Text, die es nur bei
+// diesen Kategorien gibt.
+function parseZinsFromText(text) {
+  const m = /(zinssatz|zins(?:en)?|verzinsung|p\.\s?a\.)[^\d\n]{0,25}(\d{1,2}[,.]\d{1,3})\s?%/i.exec(text)
+    || /(\d{1,2}[,.]\d{1,3})\s?%\s?(?:p\.\s?a\.|pro\s+jahr|zinsen)/i.exec(text);
+  if (!m) return null;
+  const v = parseFloat((m[2] || m[1]).replace(",", "."));
+  return v > 0 && v < 25 ? v : null;
+}
+const VERS_ART_KEYWORDS = [
+  ["kfz", /kfz|kraftfahrzeug|autoversicherung|kasko|fahrzeugversicherung|amtl\.?\s*kennzeichen/i],
+  ["wohngebaeude", /wohngeb(?:ä|ae)ude/i],
+  ["hausrat", /hausrat/i],
+  ["haftpflicht", /haftpflicht/i],
+  ["rechtsschutz", /rechtsschutz/i],
+  ["bu", /berufsunf(?:ä|ae)hig/i],
+  ["risikoleben", /risikoleben|lebensversicherung/i],
+  ["zahnzusatz", /zahnzusatz|zahnersatz/i],
+  ["krankenzusatz", /krankenzusatz|zusatzversicherung|krankenhaus-?zusatz/i],
+  ["unfall", /unfallversicherung/i],
+  ["reise", /reiseversicherung|reiseruecktritt|reiserücktritt|auslandskranken/i],
+  ["tier", /tierversicherung|hunde-?haftpflicht|tierkranken|op-versicherung/i],
+  ["handy", /handyversicherung|elektronikversicherung|ger(?:ä|ae)teversicherung/i],
+];
+function parseVersArtFromText(text) {
+  for (const [key, re] of VERS_ART_KEYWORDS) if (re.test(text)) return key;
+  return null;
+}
+function parseZahlweiseFromText(text) {
+  const m = /zahl(?:ungs)?weise[^\n]{0,20}?(monatlich|viertelj(?:ä|ae)hrlich|halbj(?:ä|ae)hrlich|j(?:ä|ae)hrlich)/i.exec(text);
+  if (!m) return null;
+  const w = m[1].toLowerCase().replace("ä", "ae");
+  return ["monatlich", "vierteljaehrlich", "halbjaehrlich", "jaehrlich"].includes(w) ? w : null;
+}
 function parseReferenceFromText(text, type) {
   const keywords = REFERENCE_KEYWORDS_BY_TYPE[type];
   if (!keywords) return null;
@@ -850,7 +1051,45 @@ const TYPE_META = {
   rechnung: { label: "Offene Rechnung" },
   sonstiges: { label: "Sonstiges" },
   garantie: { label: "Garantie" },
+  versicherung: { label: "Versicherung" },
+  festgeld: { label: "Festgeld" },
 };
+const VERS_ART_LABELS = {
+  kfz: "Kfz-Versicherung", haftpflicht: "Privathaftpflicht", hausrat: "Hausrat", wohngebaeude: "Wohngebäude",
+  rechtsschutz: "Rechtsschutz", unfall: "Unfallversicherung", bu: "Berufsunfähigkeit", risikoleben: "Risikolebensversicherung",
+  zahnzusatz: "Zahnzusatz", krankenzusatz: "Krankenzusatz", reise: "Reiseversicherung", tier: "Tierversicherung",
+  handy: "Handy-/Elektronikversicherung", sonstige: "Versicherung",
+};
+const ZAHLWEISE_META = {
+  monatlich: { label: "monatlich", proJahr: 12 },
+  vierteljaehrlich: { label: "vierteljährlich", proJahr: 4 },
+  halbjaehrlich: { label: "halbjährlich", proJahr: 2 },
+  jaehrlich: { label: "jährlich", proJahr: 1 },
+};
+const FG_LAUFZEITEN = [1, 3, 6, 9, 12, 18, 24, 36, 48, 60, 120];
+// Versicherung: Die Kündigung muss VOR Beginn der Kündigungsfrist beim
+// Versicherer sein. Ablauf 01.01. mit 3 Monaten Frist -> spätestens 30.09.
+// Ohne Frist (täglich/monatlich kündbar) erinnert die App am Ablauftag.
+function computeVersKuendigungBis(ablaufISO, fristMonate) {
+  const m = Number(fristMonate) || 0;
+  if (!m) return ablaufISO;
+  return toISO(addDays(addMonths(parseISO(ablaufISO), -m), -1));
+}
+// Festgeld: Erinnerung x Tage vor dem Laufzeitende.
+function computeFestgeldErinnerung(faelligISO, vorlaufTage) {
+  return toISO(addDays(parseISO(faelligISO), -(Number(vorlaufTage) || 0)));
+}
+// Zinsen grob (einfache Verzinsung, vor Steuern) — reicht als Orientierung.
+function computeFestgeldZinsen(betrag, zinsProzent, beginnISO, faelligISO) {
+  const b = Number(betrag), z = Number(zinsProzent);
+  if (!b || !z || !beginnISO || !faelligISO) return null;
+  const tage = Math.round((parseISO(faelligISO) - parseISO(beginnISO)) / 86400000);
+  if (!(tage > 0)) return null;
+  return Math.round(b * z / 100 * tage / 365 * 100) / 100;
+}
+function formatProzent(v) {
+  return Number(v).toLocaleString("de-DE", { maximumFractionDigits: 3 }) + " %";
+}
 
 // Sicherheit: Einträge aus einer importierten Backup-Datei kommen von
 // außen (die Datei könnte manipuliert oder von einer fremden Quelle sein).
@@ -880,6 +1119,9 @@ function sanitizeImportedEntry(raw) {
     produkt: str(raw.produkt, 200) || "Ohne Titel",
     erhalten: str(raw.erhalten, 10),
     kaufdatum: str(raw.kaufdatum, 10) || null,
+    intervall: ["monatlich", "jaehrlich", "einmalig"].includes(raw.intervall) ? raw.intervall : null,
+    serie: raw.serie === true,
+    erledigtAm: /^\d{4}-\d{2}-\d{2}$/.test(raw.erledigtAm || "") ? raw.erledigtAm : null,
     garantieJahre: (typeof raw.garantieJahre === "number" && raw.garantieJahre >= 0 && raw.garantieJahre <= 30) ? raw.garantieJahre : null,
     deadline: str(raw.deadline, 10) || toISO(new Date()),
     betrag: num(raw.betrag),
@@ -888,6 +1130,14 @@ function sanitizeImportedEntry(raw) {
     adresse: str(raw.adresse, 500),
     empfaenger: str(raw.empfaenger, 200),
     iban: str(raw.iban, 40),
+    versArt: Object.prototype.hasOwnProperty.call(VERS_ART_LABELS, raw.versArt) ? raw.versArt : null,
+    ablauf: /^\d{4}-\d{2}-\d{2}$/.test(raw.ablauf || "") ? raw.ablauf : null,
+    fristMonate: [0, 1, 3].includes(raw.fristMonate) ? raw.fristMonate : null,
+    zahlweise: Object.prototype.hasOwnProperty.call(ZAHLWEISE_META, raw.zahlweise) ? raw.zahlweise : null,
+    beginn: /^\d{4}-\d{2}-\d{2}$/.test(raw.beginn || "") ? raw.beginn : null,
+    laufzeitMonate: FG_LAUFZEITEN.includes(raw.laufzeitMonate) ? raw.laufzeitMonate : null,
+    zins: (typeof raw.zins === "number" && raw.zins > 0 && raw.zins < 25) ? raw.zins : null,
+    vorlaufTage: [0, 7, 14, 30].includes(raw.vorlaufTage) ? raw.vorlaufTage : null,
     beleg,
     status: raw.status === "erledigt" ? "erledigt" : "aktiv",
     createdAt: str(raw.createdAt, 40) || new Date().toISOString(),
@@ -1030,6 +1280,12 @@ const statGarantie = $("#stat-garantie");
 const statGarantieBtn = $("#stat-garantie-btn");
 const garantieOverlay = $("#garantie-overlay");
 const garantieList = $("#garantie-list");
+const statSavings = $("#stat-savings");
+const statSavingsBtn = $("#stat-savings-btn");
+const statSavingsLabel = $("#stat-savings-label");
+const proOverlay = $("#pro-overlay");
+const proReason = $("#pro-reason");
+const proStatus = $("#pro-status");
 const errorBox = $("#fw-error");
 
 function showError(msg) {
@@ -1037,6 +1293,78 @@ function showError(msg) {
   errorBox.style.display = "block";
   setTimeout(() => { errorBox.style.display = "none"; }, 5000);
 }
+
+let toastTimer = null;
+function showToast(msg) {
+  let el = document.getElementById("fw-toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "fw-toast";
+    el.className = "fw-toast";
+    el.setAttribute("role", "status");
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.classList.add("is-visible");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("is-visible"), 3500);
+}
+
+/* ---------- Pro: Ersparnis, Serien, Eintragslimit ---------- */
+
+// Ersparnis dieses Jahr: Abos, die rechtzeitig (am oder vor dem
+// Fristende) als erledigt = gekündigt markiert wurden. Gezählt wird der
+// vermiedene Jahresbetrag: monatlich × 12, jährlich bzw. einmalig × 1.
+// Zugeordnet wird dem Jahr, in dem gekündigt wurde.
+const INTERVALL_FAKTOR = { monatlich: 12, jaehrlich: 1, einmalig: 1 };
+function computeSavingsThisYear() {
+  const year = String(new Date().getFullYear());
+  return entries.reduce((sum, e) => {
+    if (e.type !== "abo" || e.status !== "erledigt" || !e.erledigtAm) return sum;
+    if (!e.erledigtAm.startsWith(year)) return sum;
+    if (e.erledigtAm > e.deadline) return sum; // zu spät gekündigt -> keine Ersparnis
+    const betrag = Number(e.betrag);
+    if (!betrag || !isFinite(betrag)) return sum;
+    return sum + betrag * (INTERVALL_FAKTOR[e.intervall] || 1);
+  }, 0);
+}
+
+// Abo-Serien: Ist die Frist eines laufenden Serien-Abos verstrichen, ohne
+// dass gekündigt wurde, springt sie um ein Intervall weiter (so oft wie
+// nötig, falls die App länger nicht geöffnet war). Gibt true zurück, wenn
+// sich etwas geändert hat.
+function advanceSeries() {
+  if (!hasProAccess()) return false;
+  const today = toISO(new Date());
+  let changed = false;
+  for (const e of entries) {
+    if (e.type === "versicherung" && e.serie && e.status !== "erledigt" && e.ablauf) {
+      let g = 0;
+      while (e.deadline < today && g < 100) {
+        e.ablauf = toISO(addMonths(parseISO(e.ablauf), 12));
+        e.deadline = computeVersKuendigungBis(e.ablauf, e.fristMonate);
+        g++;
+        changed = true;
+      }
+      continue;
+    }
+    if (e.type !== "abo" || !e.serie || e.status === "erledigt") continue;
+    const step = e.intervall === "jaehrlich" ? 12 : e.intervall === "monatlich" ? 1 : 0;
+    if (!step || !e.deadline) continue;
+    let guard = 0;
+    while (e.deadline < today && guard < 600) {
+      e.deadline = toISO(addMonths(parseISO(e.deadline), step));
+      guard++;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function countOpenEntries() {
+  return entries.filter((e) => e.status !== "erledigt").length;
+}
+
 
 function sortEntries(list, mode) {
   const sorted = list.slice();
@@ -1057,6 +1385,18 @@ function sortEntries(list, mode) {
 }
 
 function render() {
+  if (advanceSeries()) saveEntries(entries);
+
+  const year = new Date().getFullYear();
+  statSavingsLabel.textContent = `💶 Gespart ${year}`;
+  if (hasProAccess()) {
+    statSavings.textContent = formatEuro(computeSavingsThisYear());
+    statSavingsBtn.classList.remove("is-locked");
+  } else {
+    statSavings.textContent = "🔒";
+    statSavingsBtn.classList.add("is-locked");
+  }
+
   // Garantien laufen als eigener Bereich (Garantie-Archiv) getrennt von
   // den übrigen Fristen — sie tauchen weder in der Hauptliste noch in den
   // Dringend/Bald/Aktiv/Gesamt-Zahlen oben auf.
@@ -1085,7 +1425,7 @@ function render() {
   });
   if (query) {
     visible = visible.filter((e) => {
-      const haystack = [e.produkt, e.notiz, e.referenz].filter(Boolean).join(" ").toLowerCase();
+      const haystack = [e.produkt, e.notiz, e.referenz, e.versArt ? VERS_ART_LABELS[e.versArt] : "", TYPE_META[e.type] ? TYPE_META[e.type].label : ""].filter(Boolean).join(" ").toLowerCase();
       return haystack.includes(query);
     });
   }
@@ -1134,11 +1474,36 @@ function stampSVG(status, dleft) {
 function metaLine(entry) {
   let base;
   if (entry.type === "retoure") base = `Erhalten: ${formatDate(entry.erhalten)} · Fristende: ${formatDate(entry.deadline)}`;
-  else if (entry.type === "abo") base = `Frist/Stichtag: ${formatDate(entry.deadline)}`;
+  else if (entry.type === "abo") {
+    const intervallLabel = { monatlich: "monatlich", jaehrlich: "jährlich", einmalig: "einmalig" }[entry.intervall];
+    base = `Frist/Stichtag: ${formatDate(entry.deadline)}${intervallLabel ? ` · ${intervallLabel}` : ""}${entry.serie ? " · 🔁 Serie" : ""}`;
+  }
   else if (entry.type === "strafzettel") base = `Zahlungs-/Einspruchsfrist: ${formatDate(entry.deadline)}`;
   else if (entry.type === "rechnung") base = `Fällig am: ${formatDate(entry.deadline)}`;
   else if (entry.type === "sonstiges") base = `Frist/Stichtag: ${formatDate(entry.deadline)}`;
   else if (entry.type === "garantie") base = `${entry.kaufdatum ? `Gekauft: ${formatDate(entry.kaufdatum)} · ` : ""}Garantie bis: ${formatDate(entry.deadline)}`;
+  else if (entry.type === "versicherung") {
+    const parts = [];
+    if (entry.versArt && VERS_ART_LABELS[entry.versArt]) parts.push(VERS_ART_LABELS[entry.versArt]);
+    if (entry.ablauf) parts.push(`Ablauf: ${formatDate(entry.ablauf)}`);
+    parts.push(entry.fristMonate ? `Kündigen bis: ${formatDate(entry.deadline)}` : `Stichtag: ${formatDate(entry.deadline)}`);
+    const zw = ZAHLWEISE_META[entry.zahlweise];
+    if (zw) {
+      const betrag = Number(entry.betrag);
+      parts.push(betrag && zw.proJahr > 1 ? `Beitrag ${zw.label} (${formatEuro(betrag * zw.proJahr)}/Jahr)` : `Beitrag ${zw.label}`);
+    }
+    if (entry.serie) parts.push("🔁 jährlich");
+    base = parts.join(" · ");
+  }
+  else if (entry.type === "festgeld") {
+    const faellig = entry.ablauf || entry.deadline;
+    const parts = [`Fällig: ${formatDate(faellig)}`];
+    if (entry.zins) parts.push(`${formatProzent(entry.zins)} p. a.`);
+    const zinsen = computeFestgeldZinsen(entry.betrag, entry.zins, entry.beginn, faellig);
+    if (zinsen) parts.push(`Zinsen ca. ${formatEuro(zinsen)}`);
+    if (entry.vorlaufTage) parts.push(`Erinnerung: ${formatDate(entry.deadline)}`);
+    base = parts.join(" · ");
+  }
   else base = `Fristende: ${formatDate(entry.deadline)}`;
   if (entry.referenz) {
     base += ` · Ref.: ${entry.referenz}`;
@@ -1175,8 +1540,9 @@ function renderCard(entry) {
       <div class="fw-actions">
         <button class="fw-action" data-action="toggle">${isErledigt ? "Wieder aktivieren" : "Als erledigt markieren"}</button>
         ${entry.beleg ? `<button class="fw-action" data-action="view">Beleg ansehen</button>` : ""}
-        ${entry.type === "abo" ? `<button class="fw-action" data-action="letter">Kündigung erstellen</button>` : ""}
-        ${entry.type === "abo" ? `<button class="fw-action" data-action="compare">Alternativen vergleichen</button>` : ""}
+        ${entry.type === "abo" || entry.type === "versicherung" ? `<button class="fw-action" data-action="letter">Kündigung erstellen</button>` : ""}
+        ${entry.type === "abo" || entry.type === "versicherung" ? `<button class="fw-action" data-action="compare">Alternativen vergleichen</button>` : ""}
+        ${entry.type === "festgeld" ? `<button class="fw-action" data-action="compare">Zinsen vergleichen</button>` : ""}
         ${entry.type === "strafzettel" ? `<button class="fw-action" data-action="letter">Einspruch erstellen</button>` : ""}
         ${entry.type === "rechnung" && entry.iban ? `<button class="fw-action" data-action="copy-iban">IBAN kopieren</button>` : ""}
         <button class="fw-action danger" data-action="delete">Löschen</button>
@@ -1196,14 +1562,32 @@ function renderCard(entry) {
   }
 
   card.querySelector('[data-action="toggle"]').addEventListener("click", () => {
-    entry.status = entry.status === "erledigt" ? "aktiv" : "erledigt";
+    if (entry.status === "erledigt") {
+      // Wieder aktivieren erhöht die Zahl offener Einträge -> Limit beachten
+      if (!hasProAccess() && countOpenEntries() >= FREE_ENTRY_LIMIT) {
+        openProPaywall(`Die Gratis-Version erlaubt ${FREE_ENTRY_LIMIT} offene Einträge.`);
+        return;
+      }
+      entry.status = "aktiv";
+      entry.erledigtAm = null;
+    } else {
+      entry.status = "erledigt";
+      entry.erledigtAm = toISO(new Date());
+    }
     saveEntries(entries);
     render();
   });
   const viewBtn = card.querySelector('[data-action="view"]');
   if (viewBtn) viewBtn.addEventListener("click", () => openViewer(entry.beleg));
   const letterBtn = card.querySelector('[data-action="letter"]');
-  if (letterBtn) letterBtn.addEventListener("click", () => generateLetterPdf(entry));
+  if (letterBtn) letterBtn.addEventListener("click", () => {
+    try {
+      generateLetterPdf(entry);
+    } catch (err) {
+      console.error("Schreiben fehlgeschlagen:", err);
+      window.alert("Das Schreiben konnte nicht erstellt werden.\n\n(" + String((err && err.message) || err).slice(0, 120) + ")");
+    }
+  });
   const compareBtn = card.querySelector('[data-action="compare"]');
   if (compareBtn) compareBtn.addEventListener("click", () => openComparePopup(entry));
   const copyIbanBtn = card.querySelector('[data-action="copy-iban"]');
@@ -1263,6 +1647,30 @@ const DIRECT_DATE_FIELDS = {
   rechnung: { field: $("#field-rechnung"), input: $("#input-rechnung") },
   sonstiges: { field: $("#field-sonstiges"), input: $("#input-sonstiges") },
 };
+const fieldVersicherung = $("#field-versicherung");
+const versArtInput = $("#input-vers-art");
+const versAblaufInput = $("#input-vers-ablauf");
+const versFristInput = $("#input-vers-frist");
+const versZahlweiseInput = $("#input-vers-zahlweise");
+const versSerieInput = $("#input-vers-serie");
+const versSerieRow = $("#vers-serie-row");
+const fieldFestgeld = $("#field-festgeld");
+const fgBeginnInput = $("#input-fg-beginn");
+const fgLaufzeitInput = $("#input-fg-laufzeit");
+const fgFaelligInput = $("#input-fg-faellig");
+const fgZinsInput = $("#input-fg-zins");
+const fgVorlaufInput = $("#input-fg-vorlauf");
+const fgZinsenLine = $("#fg-zinsen-line");
+const labelProdukt = $("#label-produkt");
+const labelBetrag = $("#label-betrag");
+const labelPreview = $("#label-preview");
+let versFristTouched = false;
+// Feldbeschriftungen, die je nach Kategorie wechseln
+const TYPE_FORM_TEXTS = {
+  default: { produkt: "Produkt / Anbieter", produktPh: "z. B. Winterjacke, Zalando", betrag: "Betrag in € (optional)", betragPh: "z. B. 49,90", preview: "Berechnetes Fristende", notizPh: "z. B. Bestellnummer, Rücksendegrund …" },
+  versicherung: { produkt: "Versicherer / Tarif", produktPh: "z. B. HUK-COBURG Kfz", betrag: "Beitrag in € pro Zahlung (optional)", betragPh: "z. B. 39,90", preview: "Kündigung spätestens bis", notizPh: "z. B. Kennzeichen, Selbstbeteiligung, Ansprechpartner …" },
+  festgeld: { produkt: "Bank / Anlage", produktPh: "z. B. Consorsbank Festgeld 12 Monate", betrag: "Anlagebetrag in € (optional)", betragPh: "z. B. 10.000", preview: "Erinnerung am", notizPh: "z. B. Referenzkonto, was danach mit dem Geld passieren soll …" },
+};
 const erhaltenField = $("#field-erhalten");
 const erhaltenInput = $("#input-erhalten");
 const produktInput = $("#input-produkt");
@@ -1279,6 +1687,9 @@ const fieldZahlung = $("#field-zahlung");
 const empfaengerInput = $("#input-empfaenger");
 const ibanInput = $("#input-iban");
 const fieldGarantie = $("#field-garantie");
+const intervallInput = $("#input-intervall");
+const serieInput = $("#input-serie");
+const serieRow = $("#serie-row");
 const formTitle = $("#fw-form-title");
 const fieldArt = $("#field-art");
 const kaufdatumInput = $("#input-kaufdatum");
@@ -1323,6 +1734,8 @@ const REFERENZ_LABELS = {
   strafzettel: { label: "Aktenzeichen / Bescheidnummer (optional)", hint: "Wird, falls angegeben, im Einspruchsschreiben genannt." },
   rechnung: { label: "Rechnungs-/Verwendungszweck-Nummer (optional)", hint: "Praktisch als Verwendungszweck bei der Überweisung." },
   sonstiges: { label: "Referenz/Nummer (optional)", hint: "Beliebige Notiznummer, falls hilfreich." },
+  versicherung: { label: "Versicherungsscheinnummer (optional)", hint: "Wird, falls angegeben, im Kündigungsschreiben genannt." },
+  festgeld: { label: "Konto-/Vertragsnummer (optional)", hint: "Praktisch, wenn du der Bank vor Fälligkeit Bescheid gibst." },
 };
 
 function setVisibleFields(type) {
@@ -1338,20 +1751,35 @@ function setVisibleFields(type) {
     hintReferenz.textContent = refMeta.hint;
   }
 
-  const showAdresse = type === "abo" || type === "strafzettel";
+  const showAdresse = type === "abo" || type === "strafzettel" || type === "versicherung";
   fieldAdresse.style.display = showAdresse ? "block" : "none";
   if (showAdresse) {
-    labelAdresse.textContent = type === "abo" ? "Anbieter-Adresse (optional)" : "Behörden-/Anbieteradresse (optional)";
+    labelAdresse.textContent = type === "abo" ? "Anbieter-Adresse (optional)" : type === "versicherung" ? "Adresse des Versicherers (optional)" : "Behörden-/Anbieteradresse (optional)";
     adresseInput.placeholder = type === "abo"
       ? "Firma GmbH\nMusterstraße 2\n12345 Musterstadt"
-      : "Bußgeldstelle Musterstadt\nMusterstraße 2\n12345 Musterstadt";
+      : type === "versicherung"
+        ? "Versicherung AG\nMusterstraße 2\n12345 Musterstadt"
+        : "Bußgeldstelle Musterstadt\nMusterstraße 2\n12345 Musterstadt";
   }
+  fieldVersicherung.style.display = type === "versicherung" ? "block" : "none";
+  fieldFestgeld.style.display = type === "festgeld" ? "block" : "none";
+  const texts = TYPE_FORM_TEXTS[type] || TYPE_FORM_TEXTS.default;
+  labelProdukt.textContent = texts.produkt;
+  produktInput.placeholder = texts.produktPh;
+  labelBetrag.textContent = texts.betrag;
+  betragInput.placeholder = texts.betragPh;
+  labelPreview.textContent = texts.preview;
+  notizInput.placeholder = texts.notizPh;
 
   fieldZahlung.style.display = type === "rechnung" ? "block" : "none";
   fieldGarantie.style.display = type === "garantie" ? "block" : "none";
 }
 
 function openModal(presetType) {
+  if (!hasProAccess() && countOpenEntries() >= FREE_ENTRY_LIMIT) {
+    openProPaywall(`Die Gratis-Version erlaubt ${FREE_ENTRY_LIMIT} offene Einträge. Erledigte Einträge zählen nicht mit.`);
+    return;
+  }
   currentType = presetType || "retoure";
   currentBelegDraft = null;
   currentBelegPages = [];
@@ -1378,6 +1806,21 @@ function openModal(presetType) {
   erhaltenInput.value = toISO(new Date());
   kaufdatumInput.value = toISO(new Date());
   garantiedauerInput.value = "2";
+  intervallInput.value = "monatlich";
+  serieInput.checked = false;
+  serieRow.classList.toggle("is-locked", !hasProAccess());
+  versArtInput.value = "";
+  versAblaufInput.value = toISO(new Date(new Date().getFullYear() + 1, 0, 1));
+  versFristInput.value = "3";
+  versFristTouched = false;
+  versZahlweiseInput.value = "jaehrlich";
+  versSerieInput.checked = false;
+  versSerieRow.classList.toggle("is-locked", !hasProAccess());
+  fgBeginnInput.value = toISO(new Date());
+  fgLaufzeitInput.value = "12";
+  fgFaelligInput.value = toISO(addMonths(new Date(), 12));
+  fgZinsInput.value = "";
+  fgVorlaufInput.value = "14";
   Object.values(DIRECT_DATE_FIELDS).forEach(({ input }) => { input.value = toISO(addDays(new Date(), 14)); });
   fileInput.value = "";
   fileAddPageInput.value = "";
@@ -1404,6 +1847,8 @@ function closeModal() { overlay.style.display = "none"; }
 function activeDateInput() {
   if (currentType === "retoure") return erhaltenInput;
   if (currentType === "garantie") return kaufdatumInput;
+  if (currentType === "versicherung") return versAblaufInput;
+  if (currentType === "festgeld") return fgFaelligInput;
   const conf = DIRECT_DATE_FIELDS[currentType];
   return conf ? conf.input : null;
 }
@@ -1411,6 +1856,8 @@ function activeDateInput() {
 function currentDeadline() {
   if (currentType === "retoure") return computeRetourenDeadline(erhaltenInput.value || toISO(new Date()));
   if (currentType === "garantie") return computeGarantieEnde(kaufdatumInput.value || toISO(new Date()), garantiedauerInput.value || 0);
+  if (currentType === "versicherung") return computeVersKuendigungBis(versAblaufInput.value || toISO(new Date()), versFristInput.value);
+  if (currentType === "festgeld") return computeFestgeldErinnerung(fgFaelligInput.value || toISO(new Date()), fgVorlaufInput.value);
   const conf = DIRECT_DATE_FIELDS[currentType];
   return (conf && conf.input.value) || toISO(new Date());
 }
@@ -1419,6 +1866,13 @@ function updatePreview() {
   const d = daysUntil(deadline);
   const rest = d >= 0 ? `noch ${d} Tag${d === 1 ? "" : "e"}` : `${Math.abs(d)} Tag${Math.abs(d) === 1 ? "" : "e"} überfällig`;
   previewLine.textContent = `${formatDate(deadline)} (${rest})`;
+  if (currentType === "festgeld") {
+    const zins = parseBetragInput(fgZinsInput.value);
+    const betrag = parseBetragInput(betragInput.value);
+    const zinsen = computeFestgeldZinsen(betrag, zins, fgBeginnInput.value, fgFaelligInput.value);
+    fgZinsenLine.style.display = zinsen ? "block" : "none";
+    if (zinsen) fgZinsenLine.textContent = `Zinsen bis zur Fälligkeit: ca. ${formatEuro(zinsen)} (vor Steuern)`;
+  }
 }
 
 typeOpts.forEach((opt) => {
@@ -1431,7 +1885,59 @@ typeOpts.forEach((opt) => {
 });
 erhaltenInput.addEventListener("input", () => { dateTouched = true; });
 kaufdatumInput.addEventListener("input", () => { dateTouched = true; });
+serieInput.addEventListener("change", () => {
+  if (!hasProAccess()) {
+    serieInput.checked = false;
+    openProPaywall("Abo-Serien sind eine Pro-Funktion.");
+    return;
+  }
+  if (intervallInput.value === "einmalig") {
+    serieInput.checked = false;
+  }
+});
+intervallInput.addEventListener("change", () => {
+  if (intervallInput.value === "einmalig") serieInput.checked = false;
+});
 kaufdatumInput.addEventListener("change", updatePreview);
+// Versicherung
+versAblaufInput.addEventListener("input", () => { dateTouched = true; });
+versAblaufInput.addEventListener("change", updatePreview);
+versFristInput.addEventListener("change", () => { versFristTouched = true; updatePreview(); });
+versArtInput.addEventListener("change", () => {
+  // Kfz: Hauptfälligkeit meist 01.01., Kündigung 1 Monat vorher (30.11.)
+  if (!versFristTouched) versFristInput.value = versArtInput.value === "kfz" ? "1" : "3";
+  updatePreview();
+});
+versSerieInput.addEventListener("change", () => {
+  if (!hasProAccess()) {
+    versSerieInput.checked = false;
+    openProPaywall("Jährliche Erinnerungen sind eine Pro-Funktion.");
+  }
+});
+// Festgeld: Fälligkeit aus Beginn + Laufzeit, direkt eintragen geht auch
+function updateFestgeldFaellig() {
+  const monate = Number(fgLaufzeitInput.value);
+  if (monate && fgBeginnInput.value) fgFaelligInput.value = toISO(addMonths(parseISO(fgBeginnInput.value), monate));
+  updatePreview();
+}
+fgBeginnInput.addEventListener("change", updateFestgeldFaellig);
+fgLaufzeitInput.addEventListener("change", updateFestgeldFaellig);
+fgFaelligInput.addEventListener("input", () => { dateTouched = true; });
+fgFaelligInput.addEventListener("change", () => {
+  // Passt das Datum nicht mehr zur gewählten Laufzeit -> "Individuell"
+  const monate = Number(fgLaufzeitInput.value);
+  if (monate && fgBeginnInput.value && fgFaelligInput.value !== toISO(addMonths(parseISO(fgBeginnInput.value), monate))) {
+    fgLaufzeitInput.value = "";
+  }
+  updatePreview();
+});
+fgVorlaufInput.addEventListener("change", updatePreview);
+fgZinsInput.addEventListener("input", () => {
+  const cleaned = fgZinsInput.value.replace(/[^\d.,]/g, "");
+  if (cleaned !== fgZinsInput.value) fgZinsInput.value = cleaned;
+  fgZinsInput.setCustomValidity("");
+  updatePreview();
+});
 garantiedauerInput.addEventListener("input", updatePreview);
 erhaltenInput.addEventListener("change", updatePreview);
 Object.values(DIRECT_DATE_FIELDS).forEach(({ input }) => {
@@ -1444,6 +1950,7 @@ betragInput.addEventListener("input", () => {
   // nur Ziffern, Komma und Punkt zulassen (wie ein Zahlenfeld)
   const cleaned = betragInput.value.replace(/[^\d.,]/g, "");
   if (cleaned !== betragInput.value) betragInput.value = cleaned;
+  if (currentType === "festgeld") updatePreview();
 });
 referenzInput.addEventListener("input", () => { referenzTouched = true; });
 ibanInput.addEventListener("input", () => { ibanTouched = true; });
@@ -1622,6 +2129,7 @@ async function runOcr(file) {
       const input = activeDateInput();
       if (guessedDate && input) {
         input.value = toISO(guessedDate);
+        if (currentType === "festgeld") fgLaufzeitInput.value = "";
         updatePreview();
         dateAutoFilled = true;
         applied.push("Datum");
@@ -1658,7 +2166,26 @@ async function runOcr(file) {
       if (ref) {
         referenzInput.value = ref;
         referenzAutoFilled = true;
-        applied.push(currentType === "rechnung" ? "Referenznummer" : currentType === "abo" ? "Kundennummer" : "Aktenzeichen");
+        applied.push({ rechnung: "Referenznummer", abo: "Kundennummer", versicherung: "Versicherungsscheinnummer", festgeld: "Kontonummer", sonstiges: "Referenz" }[currentType] || "Aktenzeichen");
+      }
+    }
+    if (currentType === "versicherung") {
+      const art = parseVersArtFromText(text);
+      if (art && !versArtInput.value) {
+        versArtInput.value = art;
+        if (!versFristTouched) versFristInput.value = art === "kfz" ? "1" : "3";
+        applied.push("Versicherungsart");
+      }
+      const zw = parseZahlweiseFromText(text);
+      if (zw) { versZahlweiseInput.value = zw; applied.push("Zahlweise"); }
+      updatePreview();
+    }
+    if (currentType === "festgeld" && !fgZinsInput.value.trim()) {
+      const zins = parseZinsFromText(text);
+      if (zins) {
+        fgZinsInput.value = String(zins).replace(".", ",");
+        applied.push("Zinssatz");
+        updatePreview();
       }
     }
     if (currentType === "rechnung") {
@@ -1729,6 +2256,11 @@ overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closeMo
 form.addEventListener("submit", (e) => {
   e.preventDefault();
   if (!produktInput.value.trim()) return;
+  if (!hasProAccess() && countOpenEntries() >= FREE_ENTRY_LIMIT) {
+    closeModal();
+    openProPaywall(`Die Gratis-Version erlaubt ${FREE_ENTRY_LIMIT} offene Einträge.`);
+    return;
+  }
   const betragWert = parseBetragInput(betragInput.value);
   if (Number.isNaN(betragWert)) {
     betragInput.setCustomValidity("Bitte den Betrag als Zahl eingeben, z. B. 49,90");
@@ -1736,7 +2268,19 @@ form.addEventListener("submit", (e) => {
     betragInput.focus();
     return;
   }
+  let zinsWert = null;
+  if (currentType === "festgeld" && fgZinsInput.value.trim()) {
+    zinsWert = parseBetragInput(fgZinsInput.value);
+    if (Number.isNaN(zinsWert) || !(zinsWert > 0 && zinsWert < 25)) {
+      fgZinsInput.setCustomValidity("Bitte den Zinssatz als Zahl eingeben, z. B. 2,75");
+      fgZinsInput.reportValidity();
+      fgZinsInput.focus();
+      return;
+    }
+  }
   const deadline = currentDeadline();
+  const isVers = currentType === "versicherung";
+  const isFg = currentType === "festgeld";
   const entry = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     type: currentType,
@@ -1744,11 +2288,23 @@ form.addEventListener("submit", (e) => {
     erhalten: currentType === "retoure" ? erhaltenInput.value : null,
     kaufdatum: currentType === "garantie" ? kaufdatumInput.value : null,
     garantieJahre: currentType === "garantie" ? Number(garantiedauerInput.value) || 0 : null,
+    intervall: currentType === "abo" ? intervallInput.value : null,
+    serie: (currentType === "abo" && hasProAccess() && serieInput.checked && intervallInput.value !== "einmalig")
+      || (isVers && hasProAccess() && versSerieInput.checked),
+    erledigtAm: null,
     deadline,
     betrag: betragWert,
     notiz: notizInput.value.trim(),
     referenz: (REFERENZ_LABELS[currentType]) ? referenzInput.value.trim() : "",
-    adresse: (currentType === "abo" || currentType === "strafzettel") ? adresseInput.value.trim() : "",
+    adresse: (currentType === "abo" || currentType === "strafzettel" || isVers) ? adresseInput.value.trim() : "",
+    versArt: isVers ? (versArtInput.value || null) : null,
+    ablauf: isVers ? (versAblaufInput.value || null) : isFg ? (fgFaelligInput.value || null) : null,
+    fristMonate: isVers ? Number(versFristInput.value) : null,
+    zahlweise: isVers ? versZahlweiseInput.value : null,
+    beginn: isFg ? (fgBeginnInput.value || null) : null,
+    laufzeitMonate: isFg && fgLaufzeitInput.value ? Number(fgLaufzeitInput.value) : null,
+    zins: isFg ? zinsWert : null,
+    vorlaufTage: isFg ? Number(fgVorlaufInput.value) : null,
     empfaenger: currentType === "rechnung" ? empfaengerInput.value.trim() : "",
     iban: currentType === "rechnung" ? ibanInput.value.trim().toUpperCase() : "",
     beleg: currentBelegDraft,
@@ -1812,6 +2368,10 @@ function openViewer(beleg) {
   // prüfen. Der PDF-Viewer läuft zusätzlich in einem "sandbox"-iframe
   // ohne Skriptrechte.
   const isRealPdf = typeof beleg.dataUrl === "string" && beleg.dataUrl.startsWith("data:application/pdf");
+  if (isRealPdf && /^data:application\/pdf;filename=[^;]*;/.test(beleg.dataUrl)) {
+    beleg = Object.assign({}, beleg, { dataUrl: beleg.dataUrl.replace(/^data:application\/pdf;filename=[^;]*;/, "data:application/pdf;") });
+    currentBeleg = beleg;
+  }
   // Mehrseitige Fotobelege: jede Seite einzeln validieren, ungültige
   // Seiten werden übersprungen statt die ganze Ansicht zu blockieren.
   const pageList = Array.isArray(beleg.pages) && beleg.pages.length ? beleg.pages : [beleg.dataUrl];
@@ -1828,15 +2388,17 @@ function openViewer(beleg) {
     viewerBox.appendChild(iframe);
   } else if (isRealImage) {
     const wrap = document.createElement("div");
+    wrap.className = "fw-viewer-scroll";
     wrap.style.display = "flex";
     wrap.style.flexDirection = "column";
     wrap.style.gap = "10px";
-    wrap.style.maxHeight = "78vh";
-    wrap.style.overflowY = "auto";
     safeImagePages.forEach((src) => {
       const img = document.createElement("img");
       img.src = src;
       img.className = "fw-viewer-img";
+      img.alt = "Beleg";
+      // Zoom per Tippen (Seiten-Zoom ist in der iOS-App abgeschaltet)
+      img.addEventListener("click", () => img.classList.toggle("is-zoomed"));
       wrap.appendChild(img);
     });
     viewerBox.appendChild(wrap);
@@ -1848,8 +2410,31 @@ function openViewer(beleg) {
       : `Datei zu groß für die lokale Vorschau: ${beleg.name}`;
     viewerBox.appendChild(p);
   }
+  const hint = $("#fw-viewer-hint");
+  const shareBtn = $("#fw-viewer-share");
+  hint.textContent = isRealImage && !isRealPdf ? "Zum Vergrößern aufs Bild tippen." : "";
+  // In der iOS-App zeigt die Webansicht PDFs nur eingeschränkt an -> Teilen/Öffnen anbieten
+  shareBtn.style.display = IS_IOS_APP && (isRealPdf || isRealImage) ? "" : "none";
   viewerOverlay.style.display = "flex";
 }
+$("#fw-viewer-share").addEventListener("click", async () => {
+  if (!currentBeleg) return;
+  try {
+    const isPdf = typeof currentBeleg.dataUrl === "string" && currentBeleg.dataUrl.startsWith("data:application/pdf");
+    const src = isPdf ? currentBeleg.dataUrl : (Array.isArray(currentBeleg.pages) && currentBeleg.pages[0]) || currentBeleg.dataUrl;
+    if (isPdf) {
+      if (!src) return;
+    } else if (!sanitizeImageDataUrl(src)) {
+      return;
+    }
+    const blob = await (await fetch(src)).blob();
+    const base = (currentBeleg.name || "Beleg").replace(/\.[a-z0-9]+$/i, "").replace(/[^\w\-]+/g, "_").slice(0, 40) || "Beleg";
+    await deliverFile(blob, `${base}.${isPdf ? "pdf" : "jpg"}`, "Beleg");
+  } catch (err) {
+    console.warn("Beleg teilen fehlgeschlagen:", err);
+    window.alert(fileErrorMessage(err));
+  }
+});
 $("#fw-viewer-close").addEventListener("click", () => { viewerOverlay.style.display = "none"; });
 viewerOverlay.addEventListener("mousedown", (e) => { if (e.target === viewerOverlay) viewerOverlay.style.display = "none"; });
 
@@ -2051,17 +2636,11 @@ $("#export-confirm").addEventListener("click", async () => {
       ? await encryptBackupData(entries, exportPw.value)
       : { app: BACKUP_APP_ID, version: 1, encrypted: false, data: entries };
     const blob = new Blob([JSON.stringify(wrapper)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `fristen-waechter-backup-${toISO(new Date())}.json`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
+    await deliverFile(blob, `fristen-waechter-backup-${toISO(new Date())}.json`, "Fristen-Wächter Backup");
     exportOverlay.style.display = "none";
   } catch (e) {
-    exportError.textContent = "Backup konnte nicht erstellt werden.";
+    console.warn("Backup-Export fehlgeschlagen:", e);
+    exportError.textContent = IS_IOS_APP ? fileErrorMessage(e) : "Backup konnte nicht erstellt werden.";
     exportError.style.display = "block";
   }
 });
@@ -2290,6 +2869,332 @@ $("#garantie-close").addEventListener("click", () => { garantieOverlay.style.dis
 garantieOverlay.addEventListener("mousedown", (e) => { if (e.target === garantieOverlay) garantieOverlay.style.display = "none"; });
 $("#btn-add-garantie").addEventListener("click", () => openModal("garantie"));
 
+/* ---- Pro-Fenster (Paywall) & Kauf über den App Store ---- */
+let selectedPlan = "yearly";
+let storeProducts = {};   // productId -> Produkt aus StoreKit (Preis lokalisiert)
+let purchaseBusy = false;
+
+function setProStatus(msg) {
+  if (!msg) { proStatus.style.display = "none"; proStatus.textContent = ""; return; }
+  proStatus.textContent = msg;
+  proStatus.style.display = "block";
+}
+
+function saveProCache() {
+  try {
+    localStorage.setItem(PRO_CACHE_KEY, JSON.stringify({
+      active: proActive, until: proUntil, checkedAt: new Date().toISOString(),
+    }));
+  } catch (err) { /* Speicher voll/gesperrt -> nur kein Offline-Cache */ }
+}
+
+// Fragt bei StoreKit die aktuell gültigen Abos ab (nur von Apple
+// signierte, verifizierte Transaktionen; abgelaufene/erstattete fallen raus).
+async function refreshProStatus() {
+  if (playService) return refreshPlayStatus();
+  if (!Store) return proActive;
+  try {
+    const res = await Store.getPurchases({ productType: "subs", onlyCurrentEntitlements: true });
+    const now = Date.now();
+    const valid = ((res && res.purchases) || []).filter((t) =>
+      PRO_PRODUCT_IDS.includes(t.productIdentifier) &&
+      !t.revocationDate &&
+      t.isActive !== false &&
+      (!t.expirationDate || new Date(t.expirationDate).getTime() > now));
+    const wasActive = proActive;
+    proActive = valid.length > 0;
+    proUntil = valid
+      .map((t) => t.expirationDate)
+      .filter(Boolean)
+      .sort()
+      .pop() || null;
+    saveProCache();
+    if (wasActive !== proActive) render();
+    updateProView();
+  } catch (err) {
+    // Offline o. Ä.: letzten bekannten Status behalten.
+    console.warn("Pro-Status konnte nicht geprüft werden:", err);
+  }
+  return proActive;
+}
+
+// Google Play: aktive Abos über die Digital Goods API (listPurchases liefert
+// nur gültige, nicht abgelaufene Abos).
+async function refreshPlayStatus() {
+  try {
+    const purchases = (await playService.listPurchases()) || [];
+    const valid = purchases.filter((p) => PRO_PRODUCT_IDS.includes(p.itemId));
+    const wasActive = proActive;
+    proActive = valid.length > 0;
+    proUntil = null;
+    saveProCache();
+    if (wasActive !== proActive) render();
+    updateProView();
+  } catch (err) {
+    console.warn("Pro-Status (Google Play) konnte nicht geprüft werden:", err);
+  }
+  return proActive;
+}
+async function playPurchase(productId) {
+  const request = new PaymentRequest(
+    [{ supportedMethods: PLAY_BILLING_METHOD, data: { sku: productId } }],
+    // Pflichtfeld der Payment Request API, wird von Google Play ignoriert
+    { total: { label: "Total", amount: { currency: "EUR", value: "0" } } });
+  const response = await request.show();
+  // Die Bestätigung (acknowledge) übernimmt die Android-Hülle direkt nach dem Kauf.
+  await response.complete("success");
+}
+function storeAccountText() {
+  return playService || IS_ANDROID_TWA
+    ? "Verlängerung und Kündigung verwaltest du im Google Play Store unter „Zahlungen & Abos“."
+    : "Verlängerung und Kündigung verwaltest du über deine Apple-ID.";
+}
+
+function formatStorePrice(product, unit) {
+  return `${product.priceString} / ${unit}`;
+}
+
+async function loadStoreProducts() {
+  if (!Store && !playService) return;
+  try {
+    storeProducts = {};
+    if (playService) {
+      const details = (await playService.getDetails(PRO_PRODUCT_IDS)) || [];
+      for (const d of details) {
+        const value = Number(d.price && d.price.value);
+        const currency = (d.price && d.price.currency) || "EUR";
+        if (!isFinite(value)) continue;
+        storeProducts[d.itemId] = {
+          identifier: d.itemId,
+          price: value,
+          priceString: new Intl.NumberFormat("de-DE", { style: "currency", currency }).format(value),
+        };
+      }
+    } else {
+      const res = await Store.getProducts({ productIdentifiers: PRO_PRODUCT_IDS, productType: "subs" });
+      for (const p of (res && res.products) || []) storeProducts[p.identifier] = p;
+    }
+    const y = storeProducts[PRO_PRODUCTS.yearly.id];
+    const m = storeProducts[PRO_PRODUCTS.monthly.id];
+    if (y) $("#price-yearly").textContent = formatStorePrice(y, PRO_PRODUCTS.yearly.unit);
+    if (m) $("#price-monthly").textContent = formatStorePrice(m, PRO_PRODUCTS.monthly.unit);
+    const noteY = $("#note-yearly");
+    if (y && m && m.price > 0) {
+      const pct = Math.round((1 - y.price / (m.price * 12)) * 100);
+      noteY.textContent = pct > 0 ? `${pct} % günstiger als monatlich` : "jährlich abgerechnet";
+    }
+  } catch (err) {
+    console.warn("Abo-Produkte konnten nicht geladen werden:", err);
+  }
+}
+
+function updateProView() {
+  const active = hasProAccess() && proGatingEnabled() && isPro();
+  $("#pro-offer").style.display = active ? "none" : "block";
+  $("#pro-active").style.display = active ? "block" : "none";
+  const untilEl = $("#pro-active-until");
+  if (active && proUntil) {
+    untilEl.textContent = `Aktueller Abo-Zeitraum bis ${formatDate(proUntil.slice(0, 10))}. ${storeAccountText()}`;
+  } else {
+    untilEl.textContent = active ? storeAccountText() : "";
+  }
+}
+
+function openProPaywall(reason) {
+  proReason.textContent = reason || "Schalte alle Pro-Funktionen frei:";
+  setProStatus("");
+  updateProView();
+  proOverlay.style.display = "flex";
+  if ((Store || playService) && !Object.keys(storeProducts).length) loadStoreProducts();
+}
+
+function closeProPaywall() { proOverlay.style.display = "none"; }
+
+function openExternal(url) {
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
+$("#pro-close").addEventListener("click", closeProPaywall);
+$("#pro-close-active").addEventListener("click", closeProPaywall);
+proOverlay.addEventListener("mousedown", (e) => { if (e.target === proOverlay && !purchaseBusy) closeProPaywall(); });
+document.querySelectorAll(".fw-plan").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    selectedPlan = btn.dataset.plan;
+    document.querySelectorAll(".fw-plan").forEach((b) => b.classList.toggle("is-selected", b === btn));
+  });
+});
+
+function setPurchaseBusy(busy) {
+  purchaseBusy = busy;
+  for (const id of ["#pro-buy", "#pro-restore", "#pro-close"]) $(id).disabled = busy;
+  $("#pro-buy").textContent = busy ? "Bitte warten …" : "Pro freischalten";
+}
+
+$("#pro-buy").addEventListener("click", async () => {
+  if (!Store && !playService && playBillingReady) await playReady;
+  if (!Store && !playService) {
+    setProStatus(IS_ANDROID_TWA
+      ? "Google Play ist gerade nicht erreichbar. Bitte prüfe deine Internetverbindung und öffne die App erneut."
+      : "Der Kauf ist in dieser Version nicht verfügbar.");
+    return;
+  }
+  if (purchaseBusy) return;
+  const productId = PRO_PRODUCTS[selectedPlan].id;
+  setPurchaseBusy(true);
+  setProStatus(playService ? "Verbindung zu Google Play …" : "Verbindung zum App Store …");
+  try {
+    if (playService) {
+      await playPurchase(productId);
+    } else {
+      await Store.purchaseProduct({ productIdentifier: productId, productType: "subs" });
+    }
+    await refreshProStatus();
+    if (isPro()) {
+      setProStatus("");
+      closeProPaywall();
+      render();
+      showToast("⭐ Pro ist aktiv — viel Spaß!");
+    } else {
+      setProStatus("Der Kauf wurde abgeschlossen, das Abo ist aber noch nicht aktiv. Tippe gleich auf „Käufe wiederherstellen“.");
+    }
+  } catch (err) {
+    const msg = String((err && (err.message || err.errorMessage)) || err || "");
+    if (/cancel/i.test(msg) || (err && err.name === "AbortError")) {
+      setProStatus("");
+    } else if (/pending/i.test(msg)) {
+      setProStatus("Der Kauf wartet noch auf eine Bestätigung (z. B. durch die Familienfreigabe). Pro wird automatisch aktiv, sobald er bestätigt ist.");
+    } else if (/cannot find product|not found|item.?unavailable/i.test(msg) || (err && err.name === "NotSupportedError")) {
+      setProStatus(`Das Abo ist im ${playService ? "Google Play Store" : "App Store"} gerade nicht verfügbar. Bitte versuche es später noch einmal.`);
+    } else {
+      setProStatus("Der Kauf konnte nicht abgeschlossen werden. Bitte prüfe deine Internetverbindung und versuche es erneut.");
+    }
+    console.warn("Kauf fehlgeschlagen:", err);
+  } finally {
+    setPurchaseBusy(false);
+  }
+});
+
+$("#pro-restore").addEventListener("click", async () => {
+  if ((!Store && !playService) || purchaseBusy) return;
+  setPurchaseBusy(true);
+  setProStatus("Käufe werden wiederhergestellt …");
+  if (Store) {
+    try {
+      await Store.restorePurchases();
+    } catch (err) {
+      console.warn("Wiederherstellen (AppStore.sync) fehlgeschlagen:", err);
+    }
+  }
+  try {
+    await refreshProStatus();
+    if (isPro()) {
+      closeProPaywall();
+      render();
+      showToast("⭐ Pro wurde wiederhergestellt.");
+      setProStatus("");
+    } else {
+      setProStatus(playService ? "Für dein Google-Konto wurde kein aktives Pro-Abo gefunden." : "Für deine Apple-ID wurde kein aktives Pro-Abo gefunden.");
+    }
+  } finally {
+    setPurchaseBusy(false);
+  }
+});
+
+$("#pro-manage").addEventListener("click", async () => {
+  if (playService || IS_ANDROID_TWA) {
+    openExternal(`https://play.google.com/store/account/subscriptions?package=${ANDROID_PACKAGE}`);
+    return;
+  }
+  if (!Store) return;
+  try {
+    await Store.manageSubscriptions();
+    await refreshProStatus();
+  } catch (err) {
+    openExternal("https://apps.apple.com/account/subscriptions");
+  }
+});
+
+$("#pro-link-eula").addEventListener("click", () => openExternal(IS_ANDROID_TWA ? "https://play.google.com/intl/de/about/play-terms/" : APPLE_EULA_URL));
+$("#pro-link-privacy").addEventListener("click", () => openExternal(PRIVACY_URL));
+
+$("#menu-version").textContent = `Version ${APP_WEB_VERSION}${IS_IOS_APP ? " · iOS" : IS_ANDROID_TWA ? " · Android" : ""}`;
+let storeUiEnabled = false;
+function enableStoreUi() {
+  if (storeUiEnabled) return;
+  storeUiEnabled = true;
+  const menuPro = $("#menu-pro");
+  const menuLegal = $("#menu-legal");
+  menuPro.style.display = "";
+  menuLegal.style.display = "";
+  menuPro.addEventListener("click", () => {
+    menuDropdown.style.display = "none";
+    openProPaywall(isPro() ? "" : "Schalte alle Pro-Funktionen frei:");
+  });
+  menuLegal.addEventListener("click", () => {
+    menuDropdown.style.display = "none";
+    openExternal(PRIVACY_URL);
+  });
+}
+function applyPlayTexts() {
+  const terms = document.querySelector(".fw-pro-terms");
+  if (terms) {
+    terms.textContent = "Abo mit automatischer Verlängerung. Die Zahlung erfolgt über dein Google-Play-Konto. " +
+      "Das Abo verlängert sich automatisch um den gewählten Zeitraum zum angezeigten Preis, bis du es kündigst. " +
+      "Kündigen und verwalten kannst du das Abo jederzeit im Google Play Store unter „Zahlungen & Abos“.";
+  }
+  $("#pro-link-eula").textContent = "Google-Play-Nutzungsbedingungen";
+}
+async function initPlayBilling() {
+  if (!IS_ANDROID_TWA || typeof window.getDigitalGoodsService !== "function") return;
+  try {
+    playService = await window.getDigitalGoodsService(PLAY_BILLING_METHOD);
+    if (!playService) throw new Error("Digital Goods Service fehlt");
+  } catch (err) {
+    // z. B. alte Android-App ohne Play Billing oder Seite nicht verifiziert
+    console.warn("Google Play Billing nicht verfügbar:", err);
+    playService = null;
+    if (playBillingReady) {
+      playBillingReady = false;
+      try { localStorage.removeItem(PLAY_OK_KEY); } catch (e) { /* egal */ }
+      render();
+    }
+    return;
+  }
+  const wasReady = playBillingReady;
+  playBillingReady = true;
+  try { localStorage.setItem(PLAY_OK_KEY, "1"); } catch (e) { /* egal */ }
+  applyPlayTexts();
+  enableStoreUi();
+  await refreshPlayStatus();
+  if (!wasReady) render();
+  loadStoreProducts();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshPlayStatus();
+  });
+}
+if (playBillingReady) { applyPlayTexts(); enableStoreUi(); }
+const playReady = initPlayBilling();
+
+if (IS_IOS_APP) {
+  enableStoreUi();
+
+  // Verlängerungen, Käufe auf anderen Geräten, Erstattungen usw.
+  try {
+    Store.addListener("transactionUpdated", () => { refreshProStatus(); });
+  } catch (err) { /* Listener optional */ }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshProStatus();
+  });
+  refreshProStatus();
+  loadStoreProducts();
+}
+
+statSavingsBtn.addEventListener("click", () => {
+  if (!hasProAccess()) {
+    openProPaywall("Die Ersparnis-Auswertung ist eine Pro-Funktion.");
+  }
+});
+
 /* ---- Kündigungs-/Einspruchsschreiben als PDF ----
    Erzeugt eine fertig formatierte Brief-Vorlage (DIN-5008-ähnlich) direkt
    im Browser (jsPDF) und bietet sie zum Download an. Ohne hinterlegte
@@ -2344,9 +3249,12 @@ function generateLetterPdf(entry) {
   y += 14;
 
   const isAbo = entry.type === "abo";
+  const isVers = entry.type === "versicherung";
   doc.setFont("helvetica", "bold");
   doc.setFontSize(11.5);
-  const subject = isAbo
+  const subject = isVers
+    ? `Kündigung meines Versicherungsvertrags${entry.referenz ? " – Versicherungsscheinnummer " + entry.referenz : ""}`
+    : isAbo
     ? `Kündigung: ${entry.produkt}${entry.referenz ? " – Kundennummer " + entry.referenz : ""}`
     : `Einspruch gegen Bußgeld-/Verwarnungsbescheid${entry.referenz ? " – Aktenzeichen " + entry.referenz : ""}`;
   const subjectLines = doc.splitTextToSize(subject, textWidth);
@@ -2358,7 +3266,9 @@ function generateLetterPdf(entry) {
   doc.text("Sehr geehrte Damen und Herren,", marginLeft, y);
   y += 9;
 
-  const bodyText = isAbo
+  const bodyText = isVers
+    ? `hiermit kündige ich den oben genannten Versicherungsvertrag${entry.versArt && entry.versArt !== "sonstige" ? " (" + VERS_ART_LABELS[entry.versArt] + ")" : ""} fristgerecht zum Ablauf des Versicherungsjahres${entry.ablauf && entry.fristMonate ? " (Hauptfälligkeit " + formatDate(entry.ablauf) + ")" : ""}, hilfsweise zum nächstmöglichen Zeitpunkt.\n\nBitte bestätigen Sie mir den Erhalt dieser Kündigung sowie das genaue Vertragsende schriftlich. Ein erteiltes SEPA-Lastschriftmandat widerrufe ich zum Vertragsende.`
+    : isAbo
     ? `hiermit kündige ich den oben genannten Vertrag ordentlich zum nächstmöglichen Zeitpunkt${entry.deadline ? ", spätestens zum " + formatDate(entry.deadline) : ""}.\n\nBitte bestätigen Sie mir den Erhalt dieser Kündigung sowie das genaue Vertragsende schriftlich.`
     : `gegen den oben genannten Bescheid lege ich hiermit form- und fristgerecht Einspruch ein.\n\nEine ausführliche Begründung reiche ich gegebenenfalls gesondert nach. Ich bitte um Bestätigung des Eingangs dieses Einspruchs.`;
   const bodyLines = doc.splitTextToSize(bodyText, textWidth);
@@ -2376,9 +3286,20 @@ function generateLetterPdf(entry) {
   doc.text(doc.splitTextToSize(disclaimer, textWidth), marginLeft, 285);
   doc.setTextColor(0, 0, 0);
 
-  const prefix = isAbo ? "Kuendigung" : "Einspruch";
+  const prefix = isAbo || isVers ? "Kuendigung" : "Einspruch";
   const safeName = entry.produkt.replace(/[^\w\-]+/g, "_").replace(/_+/g, "_").slice(0, 40) || "Schreiben";
-  doc.save(`${prefix}_${safeName}.pdf`);
+  const pdfName = `${prefix}_${safeName}.pdf`;
+  if (!IS_IOS_APP) {
+    doc.save(pdfName);
+    return;
+  }
+  showToast("📄 Schreiben wird erstellt …");
+  deliverFile(doc.output("blob"), pdfName, isAbo || isVers ? "Kündigungsschreiben" : "Einspruchsschreiben").catch((err) => {
+    console.warn("Schreiben konnte nicht geteilt werden:", err);
+    // Notlösung: PDF wenigstens in der App anzeigen
+    openViewer({ name: pdfName, mime: "application/pdf", dataUrl: doc.output("datauristring") });
+    window.alert(fileErrorMessage(err) + "\n\n(" + String((err && err.message) || err).slice(0, 120) + ")");
+  });
 }
 
 /* ---------- Alternativen-Vergleich (nur per Button, keine Automatik) ----------
@@ -2429,6 +3350,16 @@ const CATEGORY_PORTALS = {
     subLabel: "Streaming-Vergleich",
     verivoxUrl: "https://www.verivox.de/streaming/angebote/",
     check24Url: "https://www.check24.de/internet/streaming/",
+  },
+  kfz: {
+    subLabel: "Kfz-Versicherungsvergleich",
+    verivoxUrl: "https://www.verivox.de/kfz-versicherung/",
+    check24Url: "https://www.check24.de/kfz-versicherung/",
+  },
+  festgeld: {
+    subLabel: "Festgeld-Vergleich",
+    verivoxUrl: "https://www.verivox.de/festgeld/",
+    check24Url: "https://www.check24.de/festgeld/",
   },
   mobilfunk: {
     subLabel: "Mobilfunk-Vergleich",
@@ -2481,9 +3412,16 @@ function makeCompareButton({ label, sub, url }) {
 // Preisangaben, da sich Abo-Preise laufend ändern; die Links bleiben
 // dadurch immer aktuell.
 function openComparePopup(entry) {
-  const provider = matchKnownProvider(entry.produkt);
-  const category = detectCategory(entry.produkt, provider);
-  const searchUrl = `https://www.google.com/search?q=${encodeURIComponent("günstigere Alternative zu " + entry.produkt)}`;
+  const isVers = entry.type === "versicherung";
+  const isFg = entry.type === "festgeld";
+  const provider = isVers || isFg ? null : matchKnownProvider(entry.produkt);
+  const category = isFg ? "festgeld" : isVers ? (entry.versArt === "kfz" ? "kfz" : null) : detectCategory(entry.produkt, provider);
+  const searchText = isFg
+    ? "Festgeld Zinsen Vergleich " + (entry.laufzeitMonate ? entry.laufzeitMonate + " Monate" : "")
+    : isVers
+      ? "günstigere " + (VERS_ART_LABELS[entry.versArt] || "Versicherung") + " als " + entry.produkt
+      : "günstigere Alternative zu " + entry.produkt;
+  const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(searchText.trim())}`;
 
   compareSubtitle.textContent = `Für: ${entry.produkt}`;
   compareButtonsWrap.innerHTML = "";
@@ -2503,7 +3441,7 @@ function openComparePopup(entry) {
     );
   }
   compareButtonsWrap.appendChild(
-    makeCompareButton({ label: "Google-Suche", sub: `"Günstigere Alternative zu ${entry.produkt}"`, url: searchUrl })
+    makeCompareButton({ label: "Google-Suche", sub: `"${searchText.trim()}"`, url: searchUrl })
   );
 
   compareOverlay.style.display = "flex";
