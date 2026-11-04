@@ -21,7 +21,7 @@ const IMPRINT_URL = "https://echoreachai.github.io/fristenwaechter/impressum.htm
 
 // Stand der iOS-Webdateien — steht unten im Menü, damit man in TestFlight
 // sofort sieht, ob der neue Build läuft.
-const APP_WEB_VERSION = "2026-11-02";
+const APP_WEB_VERSION = "2026-11-04b";
 
 // In der iOS-App stellt die Capacitor-Bridge nur window.Capacitor.nativePromise
 // bereit. Capacitor.registerPlugin() gibt es dort NICHT — das kommt aus dem
@@ -327,7 +327,8 @@ async function extractTextFromPdf(file) {
 
 function toValidDate(dStr, moStr, yStr) {
   let d = parseInt(dStr, 10), mo = parseInt(moStr, 10), y = parseInt(yStr, 10);
-  if (y < 100) y += 2000;
+  // zweistellige Jahre: "96" = 1996 (z. B. "GOÄ vom 01.01.96"), "26" = 2026
+  if (y < 100) y += y >= 70 ? 1900 : 2000;
   if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
   const date = new Date(y, mo - 1, d);
   if (isNaN(date.getTime())) return null;
@@ -384,6 +385,28 @@ const DATE_KEYWORD_TIERS_BY_TYPE = {
   ],
 };
 
+// "zahlbar innerhalb von 14 Tagen", "Zahlungsziel: 30 Tage", "14 Tage netto"
+// -> Rechnungs-/Belegdatum + N Tage (ohne erkennbares Datum: ab heute).
+function parseRelativeDueDate(lines) {
+  const text = lines.join("\n");
+  const m = /(?:zahlbar|zahlung|zu\s+zahlen|begleichen|(?:ü|ue)berweisen)[^\n]{0,40}?innerhalb\s+(?:von\s+)?(\d{1,3})\s*(?:kalender)?tag/i.exec(text)
+    || /zahlungsziel\s*[:.]?\s*(\d{1,3})\s*tag/i.exec(text)
+    || /\b(\d{1,3})\s*tage\s+netto\b/i.exec(text);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (!(n > 0 && n <= 120)) return null;
+  const dateRe = /(\d{1,2})[.\/](\d{1,2})[.\/](\d{2,4})/;
+  let base = null;
+  for (const line of lines) {
+    if (!/rechnungsdatum|belegdatum|datum\s*(?:der\s+rechnung)?\s*[:.]|ausgestellt\s+am|vom\s+\d/i.test(line)) continue;
+    if (/geburt/i.test(line)) continue;
+    const dm = dateRe.exec(line.slice(line.search(/rechnungsdatum|belegdatum|datum|ausgestellt|vom\s+\d/i)));
+    if (dm) { base = toValidDate(dm[1], dm[2], dm[3]); if (base) break; }
+  }
+  if (!base) { base = new Date(); base.setHours(0, 0, 0, 0); }
+  return addDays(base, n);
+}
+
 const GERMAN_MONTHS = ["januar", "februar", "märz", "april", "mai", "juni", "juli", "august", "september", "oktober", "november", "dezember"];
 function parseDateFromText(text, type) {
   const dateRegex = /(\d{1,2})[.\/](\d{1,2})[.\/](\d{2,4})/g;
@@ -392,22 +415,40 @@ function parseDateFromText(text, type) {
     (m, d, mon, y) => `${d}.${GERMAN_MONTHS.indexOf(mon.toLowerCase().replace("ae", "ä")) + 1}.${y}`);
   const lines = text.split("\n");
   const tiers = DATE_KEYWORD_TIERS_BY_TYPE[type] || DATE_KEYWORD_TIERS_BY_TYPE.rechnung;
+  // Plausibilität: Fristen liegen nahe der Gegenwart. Ein "01.01.96" aus
+  // einem Gesetzes-/GOÄ-Verweis oder ein Geburtsdatum ist keine Frist.
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const pastType = type === "retoure" || type === "garantie";
+  const minD = addDays(today, pastType ? -3650 : -400);
+  const maxD = pastType ? addDays(today, 60) : addMonths(today, 15 * 12);
+  const plausible = (d) => d && d >= minD && d <= maxD;
 
+  let tierIndex = 0;
   for (const tier of tiers) {
     const tierRegex = new RegExp(tier.join("|"), "i");
     for (let i = 0; i < lines.length; i++) {
-      if (!tierRegex.test(lines[i])) continue;
-      // Datum meist in derselben Zeile wie das Schlüsselwort — bei
-      // OCR-Tabellen landet es manchmal aber in einer der nächsten Zeilen.
+      const km = tierRegex.exec(lines[i]);
+      if (!km) continue;
+      // Datum meist in derselben Zeile HINTER dem Schlüsselwort — bei
+      // Zeilenumbruch oder OCR-Tabellen auch in einer der nächsten Zeilen.
+      // Daten VOR dem Stichwort ("GOÄ vom 01.01.96 … zahlbar bis") zählen nicht.
       for (let j = i; j <= Math.min(i + 2, lines.length - 1); j++) {
         dateRegex.lastIndex = 0;
         let m;
         while ((m = dateRegex.exec(lines[j]))) {
+          if (j === i && m.index < km.index) continue;
           const d = toValidDate(m[1], m[2], m[3]);
-          if (d) return d;
+          if (plausible(d)) return d;
         }
       }
     }
+    // Nach der genauesten Stufe: relative Zahlungsziele wie
+    // "zahlbar innerhalb von 14 Tagen" -> Rechnungsdatum + 14 Tage
+    if (tierIndex === 0 && (type === "rechnung" || type === "strafzettel")) {
+      const rel = parseRelativeDueDate(lines);
+      if (rel && plausible(rel)) return rel;
+    }
+    tierIndex++;
   }
 
   // Kein Schlüsselwort getroffen: Fallback auf alle gefundenen Daten. Bei
@@ -420,7 +461,7 @@ function parseDateFromText(text, type) {
     let m;
     while ((m = dateRegex.exec(line))) {
       const d = toValidDate(m[1], m[2], m[3]);
-      if (d) allDates.push(d);
+      if (plausible(d)) allDates.push(d);
     }
   }
   if (allDates.length === 0) return null;
@@ -669,6 +710,16 @@ const PROVIDER_LEGAL_RE = /(?:^|[\s,(])(GmbH\s*&\s*Co\.?\s*KGaA|GmbH\s*&\s*Co\.?
 const PROVIDER_AUTHORITY_RE = /\b(stadt|landeshauptstadt|gemeinde|landkreis|kreis|kreisverwaltung|bezirksamt|ordnungsamt|bu(?:ß|ss)geldstelle|polizei\w*|finanzamt|landratsamt|stadtkasse|kreiskasse|amtskasse|stadtwerke|stadtverwaltung|beitragsservice|krankenkasse|aok|barmer|versicherung\w*|verkehrsbetriebe|hausverwaltung|immobilien\w*|wohnungsbau\w*|rechtsanw(?:ä|ae)lt\w*|kanzlei|inkasso\w*|zahnarzt\w*|arztpraxis|praxis|klinik\w*|klinikum|universität|hochschule|verein|verband|genossenschaft|energie\w*|telekom|vodafone|fitness\w*)\b/i;
 const PROVIDER_NOISE_RE = /(iban|\bbic\b|swift|bankverbindung|kreditinstitut|konto-?n(?:umme)?r|\bblz\b|ust\.?-?id|umsatzsteuer|steuer-?n(?:umme)?r|\bhrb\b|\bhra\b|registergericht|amtsgericht|handelsregister|gesch(?:ä|ae)ftsf(?:ü|ue)hr|vorstand|aufsichtsrat|\bsitz\b|telefon|\btel\b|\bfax\b|e-?mail|www\.|https?:|seite\s*\d|\bdatum\b|kunden-?n(?:umme)?r|rechnungs-?n(?:umme)?r|aktenzeichen|gl(?:ä|ae)ubiger-?id|mandatsreferenz|verwendungszweck|betrag|\bsumme\b|\beur\b|€|\d{1,2}\.\d{1,2}\.\d{2,4}|postfach|(?:ö|oe)ffnungszeiten|servicezeit|hotline|bestellnummer|vertragsnummer)/i;
 const PROVIDER_GENERIC_START_RE = /^(ihre?|unsere?|neue|letzte|erste|zweite|dritte|\d\.)?\s*(rechnung\w*|\w*rechnung|gutschrift|mahnung|zahlungserinnerung|erinnerung|bu(?:ß|ss)geldbescheid|anh(?:ö|oe)rung\w*|verwarnung\w*|zeugenfragebogen|\w*bescheid|k(?:ü|ue)ndigung\w*|auftragsbest(?:ä|ae)tigung|bestellbest(?:ä|ae)tigung|lieferschein|quittung|kassenbon|beleg|vertrag\w*|\w*abrechnung|mitgliedsbeitrag|beitrag|zahlungsaufforderung|information|mitteilung|hinweis|wichtig|original|kopie|duplikat|herrn?|frau|familie|firma|an|betreff|seite|summe|gesamt|netto|brutto|mwst|ust|datum|kundennummer|absender|empf(?:ä|ae)nger|team)\b/i;
+// Berufsbezeichnung unter dem Namen im Briefkopf (Arzt, Anwalt, Handwerk …)
+const PROVIDER_PROFESSION_RE = /\b(zahn(?:ä|ae)rzt(?:in)?|(?:fach)?(?:ä|ae)rzt(?:in)?(?:\s+f(?:ü|ue)r\b.*)?|tier(?:ä|ae)rzt(?:in)?|kieferorthop(?:ä|ae)d\w*|allgemeinmedizin\w*|internist\w*|kinder(?:ä|ae)rzt\w*|frauen(?:ä|ae)rzt\w*|augen(?:ä|ae)rzt\w*|orthop(?:ä|ae)d\w*|dermatolog\w*|rechtsanw(?:ä|ae)lt(?:in|e)?|fachanw(?:ä|ae)lt\w*|steuerberater(?:in)?|wirtschaftspr(?:ü|ue)fer\w*|notar(?:in)?|heilpraktiker(?:in)?|physiotherap\w*|ergotherap\w*|logop(?:ä|ae)d\w*|psychotherapeut\w*|osteopath\w*|hebamme|architekt(?:in)?|ingenieurb(?:ü|ue)ro|sachverst(?:ä|ae)ndige\w*|meisterbetrieb|praxis\s+f(?:ü|ue)r\b.*|gemeinschaftspraxis|zahnarztpraxis|tierarztpraxis|kanzlei)\b/i;
+// Einzelne Zeichen, die die Texterkennung am Rand eines schief fotografierten
+// Blatts oft vor/hinter eine Zeile setzt ("| Frau", "A Sehr geehrte", "Zahnärztin re").
+function stripOcrEdgeJunk(t) {
+  return String(t || "")
+    .replace(/^(?:[^\sA-Za-zÄÖÜäöüß0-9]+\s*|[A-Za-zÄÖÜäöüß0-9]\s+(?=\S{2,})|\([A-Za-z]{1,2}\s+)+/, "")
+    .replace(/(?:\s+(?:[a-zäöü]{1,2}|[^\sA-Za-zÄÖÜäöüß0-9.]+))+$/, "")
+    .trim();
+}
 const PROVIDER_ALWAYS_GENERIC_RE = /^(sehr geehrte|guten tag|hallo|liebe[rs]?\b|mit freundlichen|freundliche gr|viele gr|vielen dank|ihr[e]?\s|unser[e]?\s|bitte\b|wir\b|sie\b)/i;
 const PROVIDER_STREET_RE = /\b\S*(stra(?:ß|ss)e|str\.|weg|platz|allee|gasse|ring|damm|ufer|chaussee|markt)\s*\d/i;
 const PAYMENT_SERVICE_RE = /(paypal|klarna|riverty|afterpay|ratepay|unzer|computop|billpay|stripe|adyen|mollie|amazon payments|payone|heidelpay|easycredit|creditplus)/i;
@@ -701,6 +752,19 @@ function providerSimilar(a, b) {
       if (prev[n] / n <= 0.2) return true;
     }
   }
+  // Wortweise mit Lesefehlern: "Dr. Wilheimy-Wundertich" ~ "Dr. Julia
+  // Wilhelmy-Wunderlich" (Rücksendezeile klein gedruckt, Briefkopf groß)
+  const lev = (x, y) => {
+    let prev = Array.from({ length: y.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= x.length; i++) {
+      const cur = [i];
+      for (let j = 1; j <= y.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x[i - 1] === y[j - 1] ? 0 : 1));
+      prev = cur;
+    }
+    return prev[y.length];
+  };
+  const sw = s.split(" ").filter((w) => w.length >= 4), lw = l.split(" ").filter((w) => w.length >= 4);
+  if (sw.length && sw.some((w) => w.length >= 6) && sw.every((w) => lw.some((v) => lev(w, v) <= (w.length >= 6 ? 2 : 1)))) return true;
   return false;
 }
 
@@ -708,6 +772,7 @@ function providerSimilar(a, b) {
 function cleanProviderName(raw, opts) {
   const o = opts || {};
   let s = (raw || "").replace(/[ \t]+/g, " ").trim();
+  s = stripOcrEdgeJunk(s);
   s = s.replace(/^[\s"'„“”‚‘’•·*\-–—|:;,.]+/, "");
   // hinter dem Namen folgende Kontodaten/Kontakte/Adresse abschneiden
   s = s.split(/\s+(?:IBAN\b|BIC\b|Konto(?:nummer|-?nr\.?)?\s*:|Bankverbindung|Bank\s*:|Kreditinstitut|Tel\.|Telefon|Fax\b|E-?Mail|www\.)/i)[0];
@@ -750,9 +815,9 @@ function detectProvider(text, lines, type, sender) {
     items = lines
       .filter((l) => l.text && l.text.trim())
       .sort((a, b) => a.top - b.top)
-      .map((l) => ({ text: l.text.trim(), top: l.top / pageH, size: l.height / medH }));
+      .map((l) => ({ text: stripOcrEdgeJunk(l.text.trim()) || l.text.trim(), top: l.top / pageH, size: l.height / medH }));
   } else {
-    items = textLines.map((t, i) => ({ text: t, top: textLines.length > 1 ? i / (textLines.length - 1) : 0, size: 1 }));
+    items = textLines.map((t, i) => ({ text: stripOcrEdgeJunk(t) || t, top: textLines.length > 1 ? i / (textLines.length - 1) : 0, size: 1 }));
   }
 
   // Empfänger-Adressfeld („Herrn/Frau …“ + 3 Folgezeilen) und eigene Adresse ausschließen
@@ -769,6 +834,9 @@ function detectProvider(text, lines, type, sender) {
   const add = (name, source, score, extra) => {
     const clean = cleanProviderName(name, Object.assign({}, cleanOpts, extra && extra.cleanOpts));
     if (!clean) return;
+    // Schwache Quellen (nur Lage/Größe): mind. ein Wort mit 4+ Buchstaben,
+    // sonst ist es meist Bildrauschen vom Rand des Fotos ("URS Pe")
+    if ((source === "briefkopf" || source === "erste-zeile") && !/[A-Za-zÄÖÜäöüß]{4,}/.test(clean)) return;
     cands.push(Object.assign({ name: clean, source, score, recipient: false }, extra || {}));
   };
 
@@ -800,7 +868,26 @@ function detectProvider(text, lines, type, sender) {
     if (!/\b\d{5}\b/.test(it.text)) return;
     if (!/\s[·•|]\s|\s[-–—]\s|\s·|·\s/.test(it.text)) return;
     const first = it.text.split(/\s*[·•|]\s*|\s[-–—]\s/)[0];
-    add(first, "ruecksendezeile", 7);
+    add(first, "ruecksendezeile", 7, { size: it.size });
+  });
+
+  // 2b) Briefkopf mit Berufsbezeichnung: Name in der Zeile direkt über
+  // „Zahnärztin“, „Rechtsanwalt“, „Steuerberater“ … (Praxen, Kanzleien)
+  items.forEach((it, i) => {
+    if (it.top > 0.4 || excluded.has(i) || it.text.split(/\s+/).length > 6) return;
+    if (!PROVIDER_PROFESSION_RE.test(it.text) || PROVIDER_NOISE_RE.test(it.text)) return;
+    const prev = items[i - 1];
+    if (prev && !excluded.has(i - 1) && !PROVIDER_NOISE_RE.test(prev.text) && !PROVIDER_PROFESSION_RE.test(prev.text)) {
+      add(prev.text, "kopf-beruf", 7.5, { size: prev.size });
+    }
+    // „Dr. Max Muster, Zahnarzt“ in einer Zeile
+    const sameLine = it.text.split(/\s*[,·|]\s*/)[0];
+    if (sameLine !== it.text && !PROVIDER_PROFESSION_RE.test(sameLine)) add(sameLine, "kopf-beruf", 7, { size: it.size });
+  });
+  // 2c) Name mit Titel oben im Briefkopf („Dr. …“, „Prof. …“)
+  items.forEach((it, i) => {
+    if (it.top > 0.3 || excluded.has(i) || PROVIDER_NOISE_RE.test(it.text)) return;
+    if (/^(?:dr\.|prof\.|dipl\.)/i.test(it.text) && it.text.split(/\s+/).length <= 6) add(it.text, "titel-name", 3, { size: it.size });
   });
 
   // 3) Firmennamen mit Rechtsform / Behörden – zeilenweise, in Segmente zerlegt
@@ -871,6 +958,12 @@ function detectProvider(text, lines, type, sender) {
     g.name = g.members.slice().sort((a, b) => {
       const la = PROVIDER_LEGAL_RE.test(a.name) ? 1 : 0, lb = PROVIDER_LEGAL_RE.test(b.name) ? 1 : 0;
       if (la !== lb) return lb - la;
+      // Gleicher Name in zwei Schriftgrößen (Briefkopf groß, Rücksendezeile
+      // winzig): die große Zeile ist meist fehlerfrei gelesen
+      if (a.size && b.size && a.name !== b.name && Math.max(a.size, b.size) / Math.min(a.size, b.size) >= 1.15) return b.size - a.size;
+      // Briefkopf über der Berufsbezeichnung = vollständiger offizieller Name
+      const ka = a.source === "kopf-beruf" ? 1 : 0, kb = b.source === "kopf-beruf" ? 1 : 0;
+      if (ka !== kb) return kb - ka;
       const ta = /^label|ruecksende/.test(a.source) ? 1 : 0, tb = /^label|ruecksende/.test(b.source) ? 1 : 0;
       if (ta !== tb) return tb - ta;
       if (counts[a.name] !== counts[b.name]) return counts[b.name] - counts[a.name];
@@ -1066,6 +1159,15 @@ const ZAHLWEISE_META = {
   halbjaehrlich: { label: "halbjährlich", proJahr: 2 },
   jaehrlich: { label: "jährlich", proJahr: 1 },
 };
+// Kategorien, die nur mit Pro angelegt werden können. Bestehende Einträge
+// bleiben auch nach Ablauf von Pro sichtbar und nutzbar (keine Daten weg).
+const PRO_TYPES = ["versicherung", "festgeld"];
+function isProType(type) { return PRO_TYPES.includes(type); }
+const PRO_TYPE_REASON = "Versicherungen und Festgeldkonten sind eine Pro-Funktion.";
+function updateTypeLocks() {
+  const locked = !hasProAccess();
+  typeOpts.forEach((o) => o.classList.toggle("is-locked", locked && isProType(o.dataset.type)));
+}
 const FG_LAUFZEITEN = [1, 3, 6, 9, 12, 18, 24, 36, 48, 60, 120];
 // Versicherung: Die Kündigung muss VOR Beginn der Kündigungsfrist beim
 // Versicherer sein. Ablauf 01.01. mit 3 Monaten Frist -> spätestens 30.09.
@@ -1781,6 +1883,8 @@ function openModal(presetType) {
     return;
   }
   currentType = presetType || "retoure";
+  if (isProType(currentType) && !hasProAccess()) currentType = "retoure";
+  updateTypeLocks();
   currentBelegDraft = null;
   currentBelegPages = [];
   dateTouched = false;
@@ -1877,6 +1981,11 @@ function updatePreview() {
 
 typeOpts.forEach((opt) => {
   opt.addEventListener("click", () => {
+    if (isProType(opt.dataset.type) && !hasProAccess()) {
+      closeModal();
+      openProPaywall(PRO_TYPE_REASON);
+      return;
+    }
     currentType = opt.dataset.type;
     typeOpts.forEach((o) => o.classList.toggle("active", o === opt));
     setVisibleFields(currentType);
@@ -2259,6 +2368,11 @@ form.addEventListener("submit", (e) => {
   if (!hasProAccess() && countOpenEntries() >= FREE_ENTRY_LIMIT) {
     closeModal();
     openProPaywall(`Die Gratis-Version erlaubt ${FREE_ENTRY_LIMIT} offene Einträge.`);
+    return;
+  }
+  if (isProType(currentType) && !hasProAccess()) {
+    closeModal();
+    openProPaywall(PRO_TYPE_REASON);
     return;
   }
   const betragWert = parseBetragInput(betragInput.value);
