@@ -181,6 +181,21 @@
             <span>🔁 Als Serie fortsetzen <span class="fw-pro-badge">PRO</span></span>
           </label>
           <p class="fw-hint">Wenn du bis zur Frist nicht kündigst, springt die Frist automatisch ein Intervall weiter — der Zähler startet neu.</p>
+
+          <details class="fw-zugang-box" id="zugang-box">
+            <summary><span aria-hidden="true">🔑</span> Zugangsdaten speichern <span class="fw-optional">(optional)</span></summary>
+            <p class="fw-hint fw-zugang-note">Werden verschlüsselt und nur auf diesem Gerät gespeichert. Lesbar sind sie nur hier in der App.</p>
+            <label class="fw-label" for="input-zugang-login">Login (E-Mail oder Benutzername)</label>
+            <input type="text" class="fw-input" id="input-zugang-login" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="200" placeholder="z. B. alex@example.de" />
+            <label class="fw-label" for="input-zugang-pw" style="margin-top:10px">Passwort</label>
+            <div class="fw-secret-row">
+              <input type="text" class="fw-input fw-secret" id="input-zugang-pw" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="200" data-lpignore="true" data-1p-ignore />
+              <button type="button" class="fw-btn-secondary fw-secret-toggle" data-target="input-zugang-pw" aria-pressed="false">Anzeigen</button>
+            </div>
+            <label class="fw-label" for="input-zugang-url" style="margin-top:10px">Login-Seite (optional)</label>
+            <input type="text" inputmode="url" class="fw-input" id="input-zugang-url" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="300" placeholder="https://…" />
+            <p class="fw-hint" id="zugang-unavailable" role="alert" style="display:none;color:var(--red)"></p>
+          </details>
         </div>
 
         <div class="fw-field" id="field-strafzettel" style="display:none">
@@ -352,6 +367,7 @@
           <input type="checkbox" id="export-encrypt-toggle" style="width:16px;height:16px;" />
           Mit Passwort verschlüsseln
         </label>
+        <p class="fw-hint" id="export-zugang-hint" style="display:none">🔑 Gespeicherte Zugangsdaten kommen nur in ein verschlüsseltes Backup. Ohne Passwort werden sie weggelassen.</p>
       </div>
       <div class="fw-field" id="export-pw-field" style="display:none">
         <label class="fw-label" for="export-pw">Passwort</label>
@@ -421,6 +437,75 @@
         <button type="button" class="fw-btn-secondary" id="sender-cancel">Abbrechen</button>
         <button type="button" class="fw-btn-primary" id="sender-save">Speichern</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Zugangsdaten (Abo) -->
+  <div class="fw-overlay" id="zugang-overlay" style="display:none">
+    <div class="fw-modal">
+      <div class="fw-modal-header-row">
+        <div>
+          <h2 class="fw-modal-title">Zugangsdaten</h2>
+          <p class="fw-modal-sub" id="zugang-sub"></p>
+        </div>
+        <button type="button" class="fw-viewer-close" id="zugang-close" aria-label="Schließen">✕</button>
+      </div>
+
+      <!-- Ansicht -->
+      <div id="zugang-view" style="display:none">
+        <div class="fw-zugang-row" id="zugang-row-login">
+          <span class="fw-label">Login</span>
+          <div class="fw-zugang-value-row">
+            <span class="fw-zugang-value" id="zugang-show-login"></span>
+            <button type="button" class="fw-action" id="zugang-copy-login">Kopieren</button>
+          </div>
+        </div>
+        <div class="fw-zugang-row" id="zugang-row-pw">
+          <span class="fw-label">Passwort</span>
+          <div class="fw-zugang-value-row">
+            <span class="fw-zugang-value fw-mono" id="zugang-show-pw" aria-live="polite">••••••••</span>
+            <button type="button" class="fw-action" id="zugang-reveal" aria-pressed="false">Anzeigen</button>
+            <button type="button" class="fw-action" id="zugang-copy-pw">Kopieren</button>
+          </div>
+        </div>
+        <div class="fw-zugang-row" id="zugang-row-url">
+          <span class="fw-label">Login-Seite</span>
+          <div class="fw-zugang-value-row">
+            <span class="fw-zugang-value" id="zugang-show-url"></span>
+            <button type="button" class="fw-action" id="zugang-open-url">Öffnen</button>
+          </div>
+        </div>
+        <p class="fw-hint">🔒 Verschlüsselt auf diesem Gerät gespeichert. Ein kopiertes Passwort wird nach 60 Sekunden aus der Zwischenablage entfernt, solange die App geöffnet ist.</p>
+        <div class="fw-modal-actions">
+          <button type="button" class="fw-btn-secondary danger" id="zugang-remove">Entfernen</button>
+          <button type="button" class="fw-btn-primary" id="zugang-edit">Bearbeiten</button>
+        </div>
+      </div>
+
+      <!-- Bearbeiten -->
+      <form id="zugang-form" style="display:none" autocomplete="off">
+        <div class="fw-field">
+          <label class="fw-label" for="zugang-edit-login">Login (E-Mail oder Benutzername)</label>
+          <input type="text" class="fw-input" id="zugang-edit-login" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="200" />
+        </div>
+        <div class="fw-field">
+          <label class="fw-label" for="zugang-edit-pw">Passwort</label>
+          <div class="fw-secret-row">
+            <input type="text" class="fw-input fw-secret" id="zugang-edit-pw" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="200" data-lpignore="true" data-1p-ignore />
+            <button type="button" class="fw-btn-secondary fw-secret-toggle" data-target="zugang-edit-pw" aria-pressed="false">Anzeigen</button>
+          </div>
+        </div>
+        <div class="fw-field">
+          <label class="fw-label" for="zugang-edit-url">Login-Seite (optional)</label>
+          <input type="text" inputmode="url" class="fw-input" id="zugang-edit-url" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="300" placeholder="https://…" />
+        </div>
+        <p class="fw-hint">Werden verschlüsselt und nur auf diesem Gerät gespeichert.</p>
+        <p class="fw-hint" id="zugang-error" role="alert" style="display:none;color:var(--red)"></p>
+        <div class="fw-modal-actions">
+          <button type="button" class="fw-btn-secondary" id="zugang-cancel">Abbrechen</button>
+          <button type="submit" class="fw-btn-primary" id="zugang-save">Speichern</button>
+        </div>
+      </form>
     </div>
   </div>
 

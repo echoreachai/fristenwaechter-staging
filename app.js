@@ -21,7 +21,7 @@ const IMPRINT_URL = "https://echoreachai.github.io/fristenwaechter/impressum.htm
 
 // Stand der iOS-Webdateien — steht unten im Menü, damit man in TestFlight
 // sofort sieht, ob der neue Build läuft.
-const APP_WEB_VERSION = "2026-11-08a";
+const APP_WEB_VERSION = "2026-11-25a";
 
 // In der iOS-App stellt die Capacitor-Bridge nur window.Capacitor.nativePromise
 // bereit. Capacitor.registerPlugin() gibt es dort NICHT — das kommt aus dem
@@ -1243,6 +1243,9 @@ function sanitizeImportedEntry(raw) {
     beleg,
     status: raw.status === "erledigt" ? "erledigt" : "aktiv",
     createdAt: str(raw.createdAt, 40) || new Date().toISOString(),
+    // Nur vorübergehend: wird beim Import sofort mit dem Geräteschlüssel
+    // verschlüsselt (und nur aus passwortgeschützten Backups übernommen).
+    _zugangKlartext: type === "abo" && raw.zugangKlartext && typeof raw.zugangKlartext === "object" ? cleanZugang(raw.zugangKlartext) : null,
   };
 }
 
@@ -1594,7 +1597,7 @@ function metaLine(entry) {
   if (entry.type === "retoure") base = `Erhalten: ${formatDate(entry.erhalten)} · Fristende: ${formatDate(entry.deadline)}`;
   else if (entry.type === "abo") {
     const intervallLabel = { monatlich: "monatlich", jaehrlich: "jährlich", einmalig: "einmalig" }[entry.intervall];
-    base = `Frist/Stichtag: ${formatDate(entry.deadline)}${intervallLabel ? ` · ${intervallLabel}` : ""}${entry.serie ? " · 🔁 Serie" : ""}`;
+    base = `Frist/Stichtag: ${formatDate(entry.deadline)}${intervallLabel ? ` · ${intervallLabel}` : ""}${entry.serie ? " · 🔁 Serie" : ""}${entry.zugang ? " · 🔑 Login gespeichert" : ""}`;
   }
   else if (entry.type === "strafzettel") base = `Zahlungs-/Einspruchsfrist: ${formatDate(entry.deadline)}`;
   else if (entry.type === "rechnung") base = `Fällig am: ${formatDate(entry.deadline)}`;
@@ -1660,6 +1663,7 @@ function renderCard(entry) {
       <div class="fw-actions">
         <button class="fw-action" data-action="toggle">${isErledigt ? "Wieder aktivieren" : "Als erledigt markieren"}</button>
         ${entry.beleg ? `<button class="fw-action" data-action="view">Beleg ansehen</button>` : ""}
+        ${entry.type === "abo" ? `<button class="fw-action" data-action="zugang">${entry.zugang ? "🔑 Zugangsdaten" : "🔑 Zugang hinzufügen"}</button>` : ""}
         ${entry.type === "abo" || entry.type === "versicherung" ? `<button class="fw-action" data-action="letter">Kündigung erstellen</button>` : ""}
         ${entry.type === "abo" || entry.type === "versicherung" ? `<button class="fw-action" data-action="compare">Alternativen vergleichen</button>` : ""}
         ${entry.type === "festgeld" ? `<button class="fw-action" data-action="compare">Zinsen vergleichen</button>` : ""}
@@ -1672,7 +1676,9 @@ function renderCard(entry) {
   card.querySelector(".fw-type-badge").textContent = typeLabel;
   card.querySelector(".fw-sr-status").textContent = `${typeLabel}, ${srStatusText(status, dleft)}`;
   // Buttons mit Eintragsnamen, damit „Löschen“ & Co. im Screenreader eindeutig sind
-  card.querySelectorAll(".fw-action").forEach((b) => b.setAttribute("aria-label", `${b.textContent}: ${entry.produkt}`));
+  card.querySelectorAll(".fw-action").forEach((b) => b.setAttribute("aria-label", `${b.textContent.replace(/^[^\p{L}\p{N}]+/u, "")}: ${entry.produkt}`));
+  const zugangBtn = card.querySelector('[data-action="zugang"]');
+  if (zugangBtn) zugangBtn.addEventListener("click", () => openZugangDialog(entry.id));
   // Texte per textContent setzen (XSS-sicher bei Nutzereingaben)
   card.querySelector(".fw-produkt").textContent = entry.produkt;
   const amountEl = card.querySelector(".fw-amount");
@@ -1933,6 +1939,7 @@ function openModal(presetType) {
   garantiedauerInput.value = "2";
   intervallInput.value = "monatlich";
   serieInput.checked = false;
+  resetZugangFormFields();
   serieRow.classList.toggle("is-locked", !hasProAccess());
   versArtInput.value = "";
   versAblaufInput.value = toISO(new Date(new Date().getFullYear() + 1, 0, 1));
@@ -1967,7 +1974,13 @@ function openModal(presetType) {
   overlay.style.display = "flex";
   produktInput.focus();
 }
-function closeModal() { overlay.style.display = "none"; }
+function closeModal() {
+  overlay.style.display = "none";
+  // Keine Klartext-Zugangsdaten im (versteckten) Formular stehen lassen
+  zugangLoginInput.value = "";
+  zugangPwInput.value = "";
+  zugangUrlInput.value = "";
+}
 
 function activeDateInput() {
   if (currentType === "retoure") return erhaltenInput;
@@ -2383,7 +2396,126 @@ $("#fab-add").addEventListener("click", () => openModal());
 $("#btn-cancel").addEventListener("click", closeModal);
 overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closeModal(); });
 
-form.addEventListener("submit", (e) => {
+/* =========================================================
+   Zugangsdaten-Tresor (Abos)
+   ---------------------------------------------------------
+   Login, Passwort und Login-Seite werden mit AES-GCM (256 Bit)
+   verschlüsselt. Der Schlüssel wird einmalig auf dem Gerät erzeugt und
+   als NICHT exportierbarer CryptoKey in IndexedDB abgelegt: Er kann
+   nicht ausgelesen oder kopiert werden, nur diese App kann damit ver-
+   und entschlüsseln. In fw_entries (localStorage) und in Backups ohne
+   Passwort steht nie Klartext.
+   ========================================================= */
+const VAULT_DB = "fw-vault";
+const VAULT_STORE = "keys";
+const VAULT_KEY_ID = "zugang-v1";
+let vaultKeyCache = null;
+
+function vaultAvailable() {
+  return !!(window.isSecureContext && window.crypto && window.crypto.subtle && window.indexedDB);
+}
+function openVaultDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(VAULT_DB, 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore(VAULT_STORE); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error("IndexedDB nicht verfügbar"));
+    req.onblocked = () => reject(new Error("IndexedDB blockiert"));
+  });
+}
+function vaultTx(db, mode, fn) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(VAULT_STORE, mode);
+    const store = tx.objectStore(VAULT_STORE);
+    const req = fn(store);
+    tx.oncomplete = () => resolve(req ? req.result : undefined);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("Abgebrochen"));
+  });
+}
+async function getVaultKey(create) {
+  if (vaultKeyCache) return vaultKeyCache;
+  if (!vaultAvailable()) throw new Error("NO_VAULT");
+  const db = await openVaultDb();
+  try {
+    let key = await vaultTx(db, "readonly", (st) => st.get(VAULT_KEY_ID));
+    if (!key && create) {
+      key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+      await vaultTx(db, "readwrite", (st) => st.put(key, VAULT_KEY_ID));
+      // Erneut lesen: falls parallel schon ein Schlüssel angelegt wurde, gilt der gespeicherte
+      key = await vaultTx(db, "readonly", (st) => st.get(VAULT_KEY_ID));
+    }
+    if (key) vaultKeyCache = key;
+    return key || null;
+  } finally {
+    db.close();
+  }
+}
+function cleanZugang(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const s = (v, max) => (typeof v === "string" ? v.trim().slice(0, max) : "");
+  const z = { login: s(raw.login, 200), passwort: typeof raw.passwort === "string" ? raw.passwort.slice(0, 200) : "", url: s(raw.url, 300) };
+  return z.login || z.passwort || z.url ? z : null;
+}
+async function encryptZugang(plain) {
+  const key = await getVaultKey(true);
+  if (!key) throw new Error("NO_KEY");
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const data = new TextEncoder().encode(JSON.stringify(plain));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data);
+  return { v: 1, iv: bufToBase64(iv), ct: bufToBase64(ct) };
+}
+async function decryptZugang(box) {
+  if (!box || box.v !== 1 || typeof box.iv !== "string" || typeof box.ct !== "string") throw new Error("BAD_FORMAT");
+  const key = await getVaultKey(false);
+  if (!key) throw new Error("NO_KEY");
+  const plainBuf = await crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(base64ToBuf(box.iv)) }, key, base64ToBuf(box.ct));
+  return cleanZugang(JSON.parse(new TextDecoder().decode(plainBuf))) || { login: "", passwort: "", url: "" };
+}
+// Gespeicherte Zugang-Box auf bekannte Form prüfen (Schutz gegen kaputte Daten)
+function validZugangBox(z) {
+  return !!(z && typeof z === "object" && z.v === 1 && typeof z.iv === "string" && typeof z.ct === "string" && z.ct.length < 4000);
+}
+function zugangUrlForOpen(url) {
+  if (!url) return null;
+  let u = url.trim();
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(u)) u = "https://" + u;
+  try {
+    const parsed = new URL(u);
+    return parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed.href : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Formularfelder beim Anlegen
+const zugangBox = $("#zugang-box");
+const zugangLoginInput = $("#input-zugang-login");
+const zugangPwInput = $("#input-zugang-pw");
+const zugangUrlInput = $("#input-zugang-url");
+const zugangUnavailable = $("#zugang-unavailable");
+function resetZugangFormFields() {
+  zugangLoginInput.value = "";
+  zugangPwInput.value = "";
+  zugangUrlInput.value = "";
+  zugangPwInput.classList.remove("is-revealed");
+  document.querySelectorAll('.fw-secret-toggle[data-target="input-zugang-pw"]').forEach((b) => { b.textContent = "Anzeigen"; b.setAttribute("aria-pressed", "false"); });
+  zugangBox.open = false;
+  zugangUnavailable.style.display = "none";
+}
+// Ein-/Ausblenden der maskierten Passwortfelder
+document.querySelectorAll(".fw-secret-toggle").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const input = document.getElementById(btn.dataset.target);
+    if (!input) return;
+    const show = !input.classList.contains("is-revealed");
+    input.classList.toggle("is-revealed", show);
+    btn.textContent = show ? "Verbergen" : "Anzeigen";
+    btn.setAttribute("aria-pressed", String(show));
+  });
+});
+
+form.addEventListener("submit", async (e) => {
   e.preventDefault();
   if (!produktInput.value.trim()) return;
   if (!hasProAccess() && countOpenEntries() >= FREE_ENTRY_LIMIT) {
@@ -2446,6 +2578,23 @@ form.addEventListener("submit", (e) => {
     status: "aktiv",
     createdAt: new Date().toISOString(),
   };
+  const zugangPlain = currentType === "abo"
+    ? cleanZugang({ login: zugangLoginInput.value, passwort: zugangPwInput.value, url: zugangUrlInput.value })
+    : null;
+  if (zugangPlain) {
+    saveBtn.disabled = true;
+    try {
+      entry.zugang = await encryptZugang(zugangPlain);
+    } catch (err) {
+      console.warn("Zugangsdaten konnten nicht verschlüsselt werden:", err);
+      zugangBox.open = true;
+      zugangUnavailable.textContent = "Zugangsdaten können auf diesem Gerät nicht sicher gespeichert werden (z. B. im privaten Modus). Bitte die Felder leeren oder die App normal öffnen.";
+      zugangUnavailable.style.display = "block";
+      saveBtn.disabled = false;
+      return;
+    }
+    saveBtn.disabled = false;
+  }
   entries.unshift(entry);
   if (saveEntries(entries)) {
     closeModal();
@@ -2743,6 +2892,7 @@ $("#menu-export").addEventListener("click", () => {
   exportPw.value = "";
   exportPw2.value = "";
   exportError.style.display = "none";
+  $("#export-zugang-hint").style.display = entries.some((e) => e.zugang) ? "block" : "none";
   exportOverlay.style.display = "flex";
 });
 $("#export-cancel").addEventListener("click", () => { exportOverlay.style.display = "none"; });
@@ -2774,9 +2924,22 @@ $("#export-confirm").addEventListener("click", async () => {
     }
   }
   try {
+    // Zugangsdaten: im passwortgeschützten Backup als Klartext INNERHALB der
+    // verschlüsselten Datei (damit sie auf einem neuen Gerät wiederherstellbar
+    // sind), im unverschlüsselten Backup komplett weggelassen.
+    let lostZugang = 0;
+    const exportEntries = encrypt
+      ? await Promise.all(entries.map(async (en) => {
+        if (!en.zugang) return en;
+        const { zugang, ...rest } = en;
+        try { return { ...rest, zugangKlartext: await decryptZugang(zugang) }; }
+        catch (err) { lostZugang++; return rest; }
+      }))
+      : entries.map(({ zugang, ...rest }) => rest);
+    if (lostZugang) console.warn(`${lostZugang} Zugangsdaten nicht lesbar – nicht im Backup.`);
     const wrapper = encrypt
-      ? await encryptBackupData(entries, exportPw.value)
-      : { app: BACKUP_APP_ID, version: 1, encrypted: false, data: entries };
+      ? await encryptBackupData(exportEntries, exportPw.value)
+      : { app: BACKUP_APP_ID, version: 1, encrypted: false, data: exportEntries };
     const blob = new Blob([JSON.stringify(wrapper)], { type: "application/json" });
     await deliverFile(blob, `fristen-waechter-backup-${toISO(new Date())}.json`, "Fristen-Wächter Backup");
     exportOverlay.style.display = "none";
@@ -2878,12 +3041,22 @@ $("#import-confirm").addEventListener("click", async () => {
     // statt beliebige Felder/Werte aus der Datei ungeprüft zu übernehmen.
     const before = importedEntries.length;
     importedEntries = importedEntries.filter((e) => e && typeof e === "object" && typeof e.id === "string").map(sanitizeImportedEntry);
+    // Zugangsdaten sofort mit dem Schlüssel DIESES Geräts verschlüsseln.
+    // Nur aus passwortgeschützten Backups übernehmen.
+    let zugangCount = 0;
+    for (const en of importedEntries) {
+      const z = en._zugangKlartext;
+      delete en._zugangKlartext;
+      if (!z || !importWrapper.encrypted) continue;
+      try { en.zugang = await encryptZugang(z); zugangCount++; }
+      catch (err) { console.warn("Zugangsdaten konnten nicht übernommen werden:", err); }
+    }
     if (importedEntries.length < before) {
       importInfo.style.display = "block";
       importInfo.textContent = `${before - importedEntries.length} Eintrag/Einträge übersprungen (ungültiges Format).`;
     }
     importInfo.style.display = "block";
-    importInfo.textContent = `${importedEntries.length} Eintrag/Einträge bereit zur Wiederherstellung.`;
+    importInfo.textContent = `${importedEntries.length} Eintrag/Einträge bereit zur Wiederherstellung${zugangCount ? ` (inkl. ${zugangCount}× Zugangsdaten)` : ""}.`;
     importInitialActions.style.display = "none";
     importModeActions.style.display = "flex";
   } catch (e) {
@@ -3591,6 +3764,171 @@ function openComparePopup(entry) {
 $("#compare-close").addEventListener("click", () => { compareOverlay.style.display = "none"; });
 compareOverlay.addEventListener("mousedown", (e) => { if (e.target === compareOverlay) compareOverlay.style.display = "none"; });
 
+
+/* ---------- Zugangsdaten-Dialog ---------- */
+const zugangOverlay = $("#zugang-overlay");
+const zugangView = $("#zugang-view");
+const zugangForm = $("#zugang-form");
+const zugangError = $("#zugang-error");
+const zugangShowPw = $("#zugang-show-pw");
+const zugangRevealBtn = $("#zugang-reveal");
+let zugangEntryId = null;
+let zugangPlainCache = null; // nur solange der Dialog offen ist
+let zugangRevealTimer = null;
+let clipboardClearTimer = null;
+
+function zugangEntry() { return entries.find((e) => e.id === zugangEntryId) || null; }
+function maskZugangPw() {
+  clearTimeout(zugangRevealTimer);
+  zugangShowPw.textContent = zugangPlainCache && zugangPlainCache.passwort ? "••••••••" : "—";
+  zugangRevealBtn.textContent = "Anzeigen";
+  zugangRevealBtn.setAttribute("aria-pressed", "false");
+}
+function showZugangView() {
+  const z = zugangPlainCache || { login: "", passwort: "", url: "" };
+  zugangForm.style.display = "none";
+  zugangView.style.display = "block";
+  $("#zugang-show-login").textContent = z.login || "—";
+  $("#zugang-copy-login").style.display = z.login ? "" : "none";
+  $("#zugang-row-pw").style.display = z.passwort ? "" : "none";
+  $("#zugang-show-url").textContent = z.url || "—";
+  $("#zugang-row-url").style.display = z.url ? "" : "none";
+  $("#zugang-open-url").style.display = zugangUrlForOpen(z.url) ? "" : "none";
+  maskZugangPw();
+}
+function showZugangForm(errorText) {
+  const z = zugangPlainCache || { login: "", passwort: "", url: "" };
+  zugangView.style.display = "none";
+  zugangForm.style.display = "block";
+  $("#zugang-edit-login").value = z.login;
+  $("#zugang-edit-pw").value = z.passwort;
+  $("#zugang-edit-url").value = z.url;
+  $("#zugang-edit-pw").classList.remove("is-revealed");
+  document.querySelectorAll('.fw-secret-toggle[data-target="zugang-edit-pw"]').forEach((b) => { b.textContent = "Anzeigen"; b.setAttribute("aria-pressed", "false"); });
+  zugangError.textContent = errorText || "";
+  zugangError.style.display = errorText ? "block" : "none";
+  $("#zugang-cancel").textContent = zugangPlainCache ? "Abbrechen" : "Schließen";
+}
+async function openZugangDialog(id) {
+  zugangEntryId = id;
+  zugangPlainCache = null;
+  const entry = zugangEntry();
+  if (!entry) return;
+  $("#zugang-sub").textContent = entry.produkt;
+  if (!vaultAvailable()) {
+    zugangPlainCache = null;
+    showZugangForm("Zugangsdaten können hier nicht sicher gespeichert werden (z. B. im privaten Modus oder ohne https).");
+    $("#zugang-save").disabled = true;
+    zugangOverlay.style.display = "flex";
+    return;
+  }
+  $("#zugang-save").disabled = false;
+  if (entry.zugang) {
+    try {
+      zugangPlainCache = await decryptZugang(entry.zugang);
+      showZugangView();
+    } catch (err) {
+      console.warn("Zugangsdaten nicht lesbar:", err);
+      zugangPlainCache = null;
+      showZugangForm("Die gespeicherten Zugangsdaten lassen sich auf diesem Gerät nicht mehr entschlüsseln (z. B. nach dem Löschen der App-Daten). Bitte neu eingeben.");
+    }
+  } else {
+    showZugangForm("");
+  }
+  zugangOverlay.style.display = "flex";
+}
+function closeZugangDialog() {
+  zugangOverlay.style.display = "none";
+  clearTimeout(zugangRevealTimer);
+  zugangPlainCache = null;
+  zugangEntryId = null;
+  // Klartext aus dem DOM entfernen
+  ["#zugang-show-login", "#zugang-show-url"].forEach((sel) => { $(sel).textContent = ""; });
+  zugangShowPw.textContent = "••••••••";
+  ["#zugang-edit-login", "#zugang-edit-pw", "#zugang-edit-url"].forEach((sel) => { $(sel).value = ""; });
+}
+async function copySecret(text, label, isPassword) {
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast(isPassword ? `${label} kopiert – wird in 60 s aus der Zwischenablage entfernt` : `${label} kopiert`);
+    if (isPassword) {
+      clearTimeout(clipboardClearTimer);
+      clipboardClearTimer = setTimeout(() => {
+        if (document.hasFocus()) navigator.clipboard.writeText("").catch(() => {});
+      }, 60000);
+    }
+  } catch (e) {
+    showToast("Kopieren nicht möglich – bitte Text markieren");
+  }
+}
+
+$("#zugang-close").addEventListener("click", closeZugangDialog);
+zugangOverlay.addEventListener("mousedown", (e) => { if (e.target === zugangOverlay) closeZugangDialog(); });
+zugangRevealBtn.addEventListener("click", () => {
+  if (!zugangPlainCache || !zugangPlainCache.passwort) return;
+  if (zugangRevealBtn.getAttribute("aria-pressed") === "true") { maskZugangPw(); return; }
+  zugangShowPw.textContent = zugangPlainCache.passwort;
+  zugangRevealBtn.textContent = "Verbergen";
+  zugangRevealBtn.setAttribute("aria-pressed", "true");
+  clearTimeout(zugangRevealTimer);
+  zugangRevealTimer = setTimeout(maskZugangPw, 30000);
+});
+$("#zugang-copy-login").addEventListener("click", () => { if (zugangPlainCache) copySecret(zugangPlainCache.login, "Login", false); });
+$("#zugang-copy-pw").addEventListener("click", () => { if (zugangPlainCache) copySecret(zugangPlainCache.passwort, "Passwort", true); });
+$("#zugang-open-url").addEventListener("click", () => {
+  const url = zugangPlainCache && zugangUrlForOpen(zugangPlainCache.url);
+  if (url) openExternal(url);
+});
+$("#zugang-edit").addEventListener("click", () => showZugangForm(""));
+$("#zugang-cancel").addEventListener("click", () => {
+  if (zugangPlainCache) showZugangView(); else closeZugangDialog();
+});
+$("#zugang-remove").addEventListener("click", () => {
+  const entry = zugangEntry();
+  if (!entry) return;
+  if (!confirm(`Zugangsdaten für "${entry.produkt}" wirklich entfernen?`)) return;
+  delete entry.zugang;
+  saveEntries(entries);
+  render();
+  closeZugangDialog();
+  showToast("Zugangsdaten entfernt");
+});
+zugangForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const entry = zugangEntry();
+  if (!entry) return;
+  const plain = cleanZugang({ login: $("#zugang-edit-login").value, passwort: $("#zugang-edit-pw").value, url: $("#zugang-edit-url").value });
+  if (!plain) {
+    if (entry.zugang) {
+      delete entry.zugang;
+      saveEntries(entries);
+      render();
+      showToast("Zugangsdaten entfernt");
+    }
+    closeZugangDialog();
+    return;
+  }
+  const saveBtnZ = $("#zugang-save");
+  saveBtnZ.disabled = true;
+  try {
+    entry.zugang = await encryptZugang(plain);
+    if (!saveEntries(entries)) throw new Error("Speichern fehlgeschlagen");
+    zugangPlainCache = plain;
+    render();
+    showZugangView();
+    showToast("Zugangsdaten verschlüsselt gespeichert");
+  } catch (err) {
+    console.warn("Zugangsdaten speichern fehlgeschlagen:", err);
+    zugangError.textContent = "Speichern nicht möglich – Zugangsdaten können auf diesem Gerät nicht sicher abgelegt werden.";
+    zugangError.style.display = "block";
+  } finally {
+    saveBtnZ.disabled = false;
+  }
+});
+// App in den Hintergrund: Passwort wieder verdecken und Dialog schließen
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden" && zugangOverlay.style.display !== "none") closeZugangDialog();
+});
 
 /* =========================================================
    Bedienungshilfen
